@@ -122,6 +122,13 @@ fn run_survives_the_launcher_and_checkpoints_without_restarting() {
     assert_eq!(fs::read_to_string(&starts).unwrap(), "start\n");
     fs::write(&release, b"").unwrap();
 
+    let result_path = jobs.join(job_id).join("result.json");
+    let result_deadline = Instant::now() + Duration::from_secs(2);
+    while !result_path.exists() && Instant::now() < result_deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(result_path.exists());
+
     let completed = stop_hook(&state, "job-flow");
     let reason = completed["reason"].as_str().unwrap();
     assert!(reason.contains("condition met"));
