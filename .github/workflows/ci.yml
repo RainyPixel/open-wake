@@ -3,11 +3,38 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  tooling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Check conventional commits
+        uses: cocogitto/cocogitto-action@v4
+        with:
+          command: check
+          args: --from-latest-tag
+      - name: Validate Lefthook configuration
+        run: npx --yes lefthook@2.1.9 validate
+      - name: Validate release configuration
+        shell: bash
+        run: |
+          jq -e '
+            .draft == true and
+            .["include-component-in-tag"] == false and
+            .["include-v-in-tag"] == true and
+            .packages["."]["release-type"] == "rust"
+          ' release-please-config.json
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          test "$(jq -r '.["."]' .release-please-manifest.json)" = "$version"
+
   msrv:
     runs-on: ubuntu-latest
     steps:

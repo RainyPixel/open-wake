@@ -1,0 +1,20 @@
+pre-commit:
+  commands:
+    rustfmt:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+    install-script:
+      glob: "install.sh"
+      run: sh -n install.sh
+
+commit-msg:
+  commands:
+    conventional-commit:
+      run: cog verify --file {1}
+
+pre-push:
+  commands:
+    clippy:
+      run: cargo clippy --all-targets -- -D warnings
+    test:
+      run: cargo test --locked

@@ -1,7 +1,7 @@
 # open-wake
 
 [![CI](https://github.com/RainyPixel/open-wake/actions/workflows/ci.yml/badge.svg)](https://github.com/RainyPixel/open-wake/actions/workflows/ci.yml)
-[![Release](https://github.com/RainyPixel/open-wake/actions/workflows/release.yml/badge.svg)](https://github.com/RainyPixel/open-wake/releases)
+[![Release](https://github.com/RainyPixel/open-wake/actions/workflows/release-please.yml/badge.svg)](https://github.com/RainyPixel/open-wake/releases)
 
 `open-wake` lets a Codex CLI turn stop while local work continues. It can run a
 small local command under a detached supervisor or observe an existing durable
@@ -54,11 +54,13 @@ release `SHA256SUMS`, and atomically installs to `~/.local/bin`. Review
 [`install.sh`](install.sh) before piping it to a shell. Pin a release when
 reproducibility matters:
 
+<!-- x-release-please-start-version -->
 ```console
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://raw.githubusercontent.com/RainyPixel/open-wake/v0.2.1/install.sh \
   | sh -s -- --version v0.2.1 --scope user
 ```
+<!-- x-release-please-end -->
 
 From a checkout:
 
@@ -122,7 +124,7 @@ verifies:
 - the current executable;
 - Codex CLI and its hooks feature;
 - the selected writable condition and supervised-job directories;
-- an isolated `arm → Stop hook → continuation` protocol smoke test;
+- an isolated `arm → hook handler → continuation` protocol smoke test;
 - supervised-job heartbeats, including stale supervisors that may have left a
   child process running;
 - the latest published GitHub release, unless offline checks are disabled;
@@ -135,6 +137,9 @@ Failed checks exit non-zero and include an exact setup command. A stale job is
 a warning with its ID and log path because heartbeat loss is not proof that the
 child stopped. Hook trust remains a warning because Codex exposes that review
 as interactive `/hooks` state rather than a stable non-interactive readback.
+The isolated protocol smoke test proves the handler but cannot prove that the
+current Codex host invoked the configured `Stop` hook. Doctor reports an
+expired active condition with zero attempts as evidence that it did not.
 
 ## Run a local job
 
@@ -246,6 +251,13 @@ The protocol and ownership invariants are documented in
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
+cog check --from-latest-tag
+lefthook validate
 ```
+
+Run `lefthook install` once per clone to enable the local formatting,
+Conventional Commit, clippy, and test gates. Release Please owns version bumps,
+`CHANGELOG.md`, tags, and GitHub Releases; Cocogitto is validation-only in this
+repository.
 
 `open-wake` is licensed under the MIT License.
