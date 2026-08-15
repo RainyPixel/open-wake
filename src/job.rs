@@ -603,9 +603,9 @@ mod tests {
         )
         .unwrap();
 
-        let error = spawn_supervisor(Path::new("/bin/false"), &root.0, &spec.id).unwrap_err();
+        let error = spawn_supervisor(Path::new("false"), &root.0, &spec.id).unwrap_err();
 
-        assert!(error.contains("before acknowledging startup"));
+        assert!(error.contains("before acknowledging startup"), "{error}");
         assert!(!root.0.join(&spec.id).join("heartbeat").exists());
     }
 }
