@@ -57,8 +57,8 @@ reproducibility matters:
 <!-- x-release-please-start-version -->
 ```console
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/RainyPixel/open-wake/v0.2.2/install.sh \
-  | sh -s -- --version v0.2.2 --scope user
+  https://raw.githubusercontent.com/RainyPixel/open-wake/v0.3.0/install.sh \
+  | sh -s -- --version v0.3.0 --scope user
 ```
 <!-- x-release-please-end -->
 
