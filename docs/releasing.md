@@ -24,6 +24,9 @@ by hand, and do not run `cog bump`. Cocogitto validates commit history only.
 The workflow uses `GITHUB_TOKEN`. GitHub suppresses ordinary workflow events
 created by that token, so the release workflow explicitly dispatches CI for
 generated release PRs and performs artifact publication in the same run.
+Release creation and release-PR creation are separate Release Please passes.
+The PR pass is skipped when the release pass creates a release, ensuring the
+new tag is visible as the next run's changelog baseline.
 
 If a native build or upload fails, the release remains a draft. Rerun the
 failed workflow jobs; uploads use `--clobber`, so a successful rerun repairs the

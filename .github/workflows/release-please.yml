@@ -20,8 +20,8 @@ jobs:
       issues: write
       pull-requests: write
     outputs:
-      pr: ${{ steps.release.outputs.pr }}
-      prs_created: ${{ steps.release.outputs.prs_created }}
+      pr: ${{ steps.release_pr.outputs.pr }}
+      prs_created: ${{ steps.release_pr.outputs.prs_created }}
       release_created: ${{ steps.release.outputs.release_created }}
       release_sha: ${{ steps.release.outputs.sha }}
       tag_name: ${{ steps.release.outputs.tag_name }}
@@ -32,6 +32,15 @@ jobs:
           token: ${{ github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+      - id: release_pr
+        if: steps.release.outputs.release_created != 'true'
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
 
   release-pr-ci:
     needs: release-please
