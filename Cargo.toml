@@ -1,5 +1,5 @@
 [package]
-name = "codex-wake"
+name = "open-wake"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
@@ -8,8 +8,8 @@ license = "MIT"
 readme = "README.md"
 keywords = ["codex", "hooks", "automation", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-repository = "https://github.com/RainyPixel/codex-wake"
-homepage = "https://github.com/RainyPixel/codex-wake"
+repository = "https://github.com/RainyPixel/open-wake"
+homepage = "https://github.com/RainyPixel/open-wake"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

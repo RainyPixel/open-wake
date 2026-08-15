@@ -1,21 +1,21 @@
 #!/bin/sh
 set -eu
 
-repository="${CODEX_WAKE_REPOSITORY:-RainyPixel/codex-wake}"
-version="${CODEX_WAKE_VERSION:-latest}"
-bin_dir="${CODEX_WAKE_INSTALL_DIR:-$HOME/.local/bin}"
+repository="${OPEN_WAKE_REPOSITORY:-RainyPixel/open-wake}"
+version="${OPEN_WAKE_VERSION:-latest}"
+bin_dir="${OPEN_WAKE_INSTALL_DIR:-$HOME/.local/bin}"
 scope=""
 
 usage() {
     cat <<'EOF'
-Install the latest codex-wake release.
+Install the latest open-wake release.
 
 Usage: install.sh [--scope project|user] [--version vX.Y.Z] [--bin-dir PATH]
 
 Environment:
-  CODEX_WAKE_INSTALL_DIR  Destination directory (default: ~/.local/bin)
-  CODEX_WAKE_VERSION      Release tag or latest
-  CODEX_WAKE_REPOSITORY   GitHub owner/repository override
+  OPEN_WAKE_INSTALL_DIR  Destination directory (default: ~/.local/bin)
+  OPEN_WAKE_VERSION      Release tag or latest
+  OPEN_WAKE_REPOSITORY   GitHub owner/repository override
 EOF
 }
 
@@ -86,9 +86,9 @@ esac
 command -v curl >/dev/null 2>&1 || { echo "install.sh: curl is required" >&2; exit 1; }
 command -v tar >/dev/null 2>&1 || { echo "install.sh: tar is required" >&2; exit 1; }
 
-asset="codex-wake-$target.tar.gz"
+asset="open-wake-$target.tar.gz"
 base_url="https://github.com/$repository/releases/$release_path"
-temporary="$(mktemp -d "${TMPDIR:-/tmp}/codex-wake-install.XXXXXX")"
+temporary="$(mktemp -d "${TMPDIR:-/tmp}/open-wake-install.XXXXXX")"
 pending=""
 cleanup() {
     [ -z "$pending" ] || rm -f "$pending"
@@ -127,7 +127,7 @@ fi
 }
 
 tar -tzf "$temporary/$asset" >"$temporary/archive.list"
-[ "$(grep -c '^codex-wake$' "$temporary/archive.list")" -eq 1 ] || {
+[ "$(grep -c '^open-wake$' "$temporary/archive.list")" -eq 1 ] || {
     echo "install.sh: release archive has an unexpected layout" >&2
     exit 1
 }
@@ -136,12 +136,12 @@ while IFS= read -r entry; do
         *"/../"*|"//"*) echo "install.sh: release archive contains an unsafe path" >&2; exit 1 ;;
     esac
 done <"$temporary/archive.list"
-tar -xzf "$temporary/$asset" -C "$temporary" codex-wake
+tar -xzf "$temporary/$asset" -C "$temporary" open-wake
 
 mkdir -p "$bin_dir"
-destination="$bin_dir/codex-wake"
-pending="$bin_dir/.codex-wake.install.$$"
-cp "$temporary/codex-wake" "$pending"
+destination="$bin_dir/open-wake"
+pending="$bin_dir/.open-wake.install.$$"
+cp "$temporary/open-wake" "$pending"
 chmod 0755 "$pending"
 mv "$pending" "$destination"
 pending=""
@@ -155,14 +155,14 @@ esac
 
 if [ "$scope" = "project" ] && [ "$path_ready" = false ]; then
     echo "install.sh: installed the binary, but project scope requires $bin_dir on PATH" >&2
-    echo "add it to PATH, then run: codex-wake setup --scope project" >&2
+    echo "add it to PATH, then run: open-wake setup --scope project" >&2
     exit 1
 fi
 
 if [ -n "$scope" ]; then
     "$destination" setup --scope "$scope"
 else
-    echo "next: codex-wake setup --scope project|user"
+    echo "next: open-wake setup --scope project|user"
 fi
 
 if [ "$path_ready" = false ]; then

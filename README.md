@@ -1,9 +1,9 @@
-# codex-wake
+# open-wake
 
-[![CI](https://github.com/RainyPixel/codex-wake/actions/workflows/ci.yml/badge.svg)](https://github.com/RainyPixel/codex-wake/actions/workflows/ci.yml)
-[![Release](https://github.com/RainyPixel/codex-wake/actions/workflows/release.yml/badge.svg)](https://github.com/RainyPixel/codex-wake/releases)
+[![CI](https://github.com/RainyPixel/open-wake/actions/workflows/ci.yml/badge.svg)](https://github.com/RainyPixel/open-wake/actions/workflows/ci.yml)
+[![Release](https://github.com/RainyPixel/open-wake/actions/workflows/release.yml/badge.svg)](https://github.com/RainyPixel/open-wake/releases)
 
-`codex-wake` lets a Codex CLI turn stop while a local condition is checked.
+`open-wake` lets a Codex CLI turn stop while a local condition is checked.
 When the condition succeeds or reaches its deadline, Codex receives one bounded
 continuation message and resumes the same task.
 
@@ -11,15 +11,18 @@ It uses the Codex `Stop` hook instead of terminal input injection. The wake-up
 path is therefore the same in a plain terminal, zellij, tmux, or another
 terminal multiplexer.
 
+Codex CLI is the only implemented agent adapter today. Planned integrations
+and their acceptance criteria are tracked in [ROADMAP.md](ROADMAP.md).
+
 ## Why
 
 Repeated model-side polling wastes tokens and fills the conversation with
-status output. `codex-wake` moves that wait into a local hook process:
+status output. `open-wake` moves that wait into a local hook process:
 
 1. The agent starts work under an independent supervisor.
 2. The agent arms a cheap, read-only predicate and ends its turn.
 3. Codex invokes the synchronous `Stop` hook.
-4. `codex-wake` checks the predicate locally until it exits `0` or times out.
+4. `open-wake` checks the predicate locally until it exits `0` or times out.
 5. The hook asks Codex for one continuation with the final result.
 
 No model request is made while the hook is waiting. Predicate output is bounded
@@ -30,7 +33,7 @@ to 4 KiB and enters the conversation only with the final result.
 - Linux or macOS
 - Rust 1.85 or newer to build from source
 - Codex CLI with the `hooks` feature enabled
-- A separately supervised long-running job; `codex-wake` observes it but does
+- A separately supervised long-running job; `open-wake` observes it but does
   not keep an ordinary foreground command alive
 
 ## Install
@@ -39,7 +42,7 @@ One-shot install and user setup:
 
 ```console
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/RainyPixel/codex-wake/main/install.sh \
+  https://raw.githubusercontent.com/RainyPixel/open-wake/main/install.sh \
   | sh -s -- --scope user
 ```
 
@@ -51,7 +54,7 @@ reproducibility matters:
 
 ```console
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/RainyPixel/codex-wake/v0.1.0/install.sh \
+  https://raw.githubusercontent.com/RainyPixel/open-wake/v0.1.0/install.sh \
   | sh -s -- --version v0.1.0 --scope user
 ```
 
@@ -64,15 +67,15 @@ cargo install --path . --locked
 Choose exactly one setup scope:
 
 ```console
-# Writes .codex/hooks.json and .agents/skills/codex-wake in this repository.
-codex-wake setup --scope project
+# Writes .codex/hooks.json and .agents/skills/open-wake in this repository.
+open-wake setup --scope project
 
-# Writes ~/.codex/hooks.json and ~/.agents/skills/codex-wake.
-codex-wake setup --scope user
+# Writes ~/.codex/hooks.json and ~/.agents/skills/open-wake.
+open-wake setup --scope user
 ```
 
 `global` is accepted as an alias for `user`. Project setup uses
-`codex-wake hook`, so every contributor using the checked-in hook must have the
+`open-wake hook`, so every contributor using the checked-in hook must have the
 binary on `PATH`. User setup records the current executable's absolute path.
 
 Setup merges its `Stop` entry with existing hooks and is idempotent. It installs
@@ -86,9 +89,9 @@ command, and trust the installed definition before relying on it.
 ## Updates
 
 ```console
-codex-wake update --check
-codex-wake update
-codex-wake update --yes
+open-wake update --check
+open-wake update
+open-wake update --yes
 ```
 
 `update` queries the latest GitHub Release, selects the current OS/architecture
@@ -98,18 +101,18 @@ default; `--yes` is intended for explicit automation. Development binaries
 inside `target/debug` or `target/release` are never self-updated.
 
 `doctor` also reports a newer release as a warning. Set
-`CODEX_WAKE_NO_UPDATE_CHECK=1` for a fully offline doctor run. There is no
+`OPEN_WAKE_NO_UPDATE_CHECK=1` for a fully offline doctor run. There is no
 background daemon, telemetry, or automatic update installation.
 
 ## Doctor
 
 ```console
-codex-wake doctor
-codex-wake doctor --scope project
-codex-wake doctor --scope user --json
+open-wake doctor
+open-wake doctor --scope project
+open-wake doctor --scope user --json
 ```
 
-Without `--scope`, doctor checks every detected `codex-wake` installation. It
+Without `--scope`, doctor checks every detected `open-wake` installation. It
 verifies:
 
 - the current executable;
@@ -118,7 +121,7 @@ verifies:
 - the latest published GitHub release, unless offline checks are disabled;
 - the selected hook command, timeout, and ownership marker;
 - the installed skill bytes;
-- whether `codex-wake` is on `PATH` for project scope.
+- whether `open-wake` is on `PATH` for project scope.
 
 Doctor never repairs configuration. Failed checks exit non-zero and include an
 exact setup command. Hook trust remains a warning because Codex exposes that
@@ -131,7 +134,7 @@ The predicate must be fast, read-only, and idempotent. Exit `0` means ready; any
 other exit status means not ready yet.
 
 ```console
-codex-wake arm \
+open-wake arm \
   --label "release build" \
   --timeout 1h \
   --interval 10s \
@@ -145,21 +148,21 @@ the turn immediately. It must not poll `status` in that turn.
 Useful lifecycle commands:
 
 ```console
-codex-wake status
-codex-wake status --json
-codex-wake cancel
-codex-wake update --check
-codex-wake uninstall --scope project
+open-wake status
+open-wake status --json
+open-wake cancel
+open-wake update --check
+open-wake uninstall --scope project
 ```
 
 One condition can be active per Codex session. Runtime state lives under
-`$XDG_RUNTIME_DIR/codex-wake`, or a private user directory under the system temp
+`$XDG_RUNTIME_DIR/open-wake`, or a private user directory under the system temp
 directory when `XDG_RUNTIME_DIR` is unavailable. Override it with
-`CODEX_WAKE_STATE_DIR` or `--state-dir`.
+`OPEN_WAKE_STATE_DIR` or `--state-dir`.
 
 ## Starting durable work
 
-`codex-wake` deliberately does not guess how a build, deployment, or remote job
+`open-wake` deliberately does not guess how a build, deployment, or remote job
 should be supervised. Use the platform's real authority when one exists:
 systemd, launchd, Kubernetes, CI, a remote build service, or the application's
 job runner. Arm a predicate against a durable status, exit-code file, or
@@ -168,11 +171,11 @@ purpose-built read-only status script.
 For a small local Unix job, a detached wrapper can record its exit status:
 
 ```console
-job_dir="$(mktemp -d -p /var/tmp codex-wake-job.XXXXXX)"
+job_dir="$(mktemp -d -p /var/tmp open-wake-job.XXXXXX)"
 nohup sh -c 'cargo build --release; printf "%s\n" "$?" >"$1/exit-code"' \
   sh "$job_dir" >"$job_dir/output.log" 2>&1 </dev/null &
 
-codex-wake arm --label "release build" --timeout 1h -- \
+open-wake arm --label "release build" --timeout 1h -- \
   sh -c 'test -f "$1/exit-code"' sh "$job_dir"
 ```
 
@@ -203,4 +206,4 @@ cargo clippy --all-targets -- -D warnings
 cargo test --locked
 ```
 
-`codex-wake` is licensed under the MIT License.
+`open-wake` is licensed under the MIT License.

@@ -8,11 +8,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const MANAGED_STATUS_MESSAGE: &str = "codex-wake: waiting for armed condition";
-const LEGACY_STATUS_MESSAGE: &str = "Waiting for the armed condition";
+pub const MANAGED_STATUS_MESSAGE: &str = "open-wake: waiting for armed condition";
 const HOOK_DESCRIPTION: &str = "Resume Codex when an armed local condition completes.";
-const SKILL_MD: &str = include_str!("../skills/codex-wake/SKILL.md");
-const OPENAI_YAML: &str = include_str!("../skills/codex-wake/agents/openai.yaml");
+const SKILL_MD: &str = include_str!("../skills/open-wake/SKILL.md");
+const OPENAI_YAML: &str = include_str!("../skills/open-wake/agents/openai.yaml");
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -45,8 +44,8 @@ impl SetupTarget {
         Self {
             scope: InstallScope::Project,
             hook_path: project_root.join(".codex/hooks.json"),
-            skill_dir: project_root.join(".agents/skills/codex-wake"),
-            hook_command: "codex-wake hook".to_owned(),
+            skill_dir: project_root.join(".agents/skills/open-wake"),
+            hook_command: "open-wake hook".to_owned(),
             hook_mode: 0o644,
         }
     }
@@ -55,14 +54,14 @@ impl SetupTarget {
         Self {
             scope: InstallScope::User,
             hook_path: codex_home.join("hooks.json"),
-            skill_dir: home.join(".agents/skills/codex-wake"),
+            skill_dir: home.join(".agents/skills/open-wake"),
             hook_command: format!("{} hook", shell_quote(binary.as_os_str())),
             hook_mode: 0o600,
         }
     }
 
     pub fn setup_command(&self) -> String {
-        format!("codex-wake setup --scope {}", self.scope.as_str())
+        format!("open-wake setup --scope {}", self.scope.as_str())
     }
 
     pub fn has_any_installation(&self) -> bool {
@@ -135,7 +134,6 @@ pub fn setup(target: &SetupTarget, dry_run: bool) -> Result<SetupReport, String>
         dry_run,
         target.skill_dir.join("agents/openai.yaml").exists(),
     )?);
-
     Ok(SetupReport {
         scope: target.scope,
         dry_run,
@@ -193,7 +191,6 @@ pub fn uninstall(target: &SetupTarget, dry_run: bool) -> Result<SetupReport, Str
         OPENAI_YAML.as_bytes(),
         dry_run,
     )?);
-
     if !dry_run {
         remove_if_empty(&target.skill_dir.join("agents"))?;
         remove_if_empty(&target.skill_dir)?;
@@ -385,17 +382,7 @@ fn managed_handlers(root: &Value) -> Result<Vec<&Map<String, Value>>, String> {
 }
 
 fn is_managed_handler(value: &Value) -> bool {
-    match value.get("statusMessage").and_then(Value::as_str) {
-        Some(MANAGED_STATUS_MESSAGE) => true,
-        Some(LEGACY_STATUS_MESSAGE) => {
-            value.get("type").and_then(Value::as_str) == Some("command")
-                && value
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(|command| command.contains("codex-wake"))
-        }
-        _ => false,
-    }
+    value.get("statusMessage").and_then(Value::as_str) == Some(MANAGED_STATUS_MESSAGE)
 }
 
 fn is_empty_managed_hook_file(root: &Value) -> bool {
@@ -490,7 +477,7 @@ fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<(), String> {
         ".{}.{}.{}.tmp",
         path.file_name()
             .and_then(OsStr::to_str)
-            .unwrap_or("codex-wake"),
+            .unwrap_or("open-wake"),
         std::process::id(),
         sequence
     ));

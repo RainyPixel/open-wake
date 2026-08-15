@@ -1,0 +1,4 @@
+interface:
+  display_name: "Open Wake"
+  short_description: "Sleep on local conditions without polling"
+  default_prompt: "Use $open-wake to wait for this long-running task without polling."

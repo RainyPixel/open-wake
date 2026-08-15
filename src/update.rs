@@ -10,9 +10,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const REPOSITORY: &str = "RainyPixel/codex-wake";
+pub const REPOSITORY: &str = "RainyPixel/open-wake";
 const API_LATEST_RELEASE: &str =
-    "https://api.github.com/repos/RainyPixel/codex-wake/releases/latest";
+    "https://api.github.com/repos/RainyPixel/open-wake/releases/latest";
 const CHECKSUMS_ASSET: &str = "SHA256SUMS";
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
@@ -81,7 +81,7 @@ pub fn install_release(release: &AvailableRelease, executable: &Path) -> Result<
     verify_checksum(&checksums_path, &asset_name, &archive_path)?;
     validate_archive(&archive_path)?;
     extract_binary(&archive_path, workspace.as_ref())?;
-    let candidate = workspace.as_ref().join("codex-wake");
+    let candidate = workspace.as_ref().join("open-wake");
     validate_candidate(&candidate, &release.version)?;
     atomic_replace_executable(&candidate, executable)
 }
@@ -94,7 +94,7 @@ pub fn platform_asset_name() -> Result<String, String> {
         ("macos", "aarch64") => "aarch64-apple-darwin",
         (os, arch) => return Err(format!("no release binary is published for {os}/{arch}")),
     };
-    Ok(format!("codex-wake-{target}.tar.gz"))
+    Ok(format!("open-wake-{target}.tar.gz"))
 }
 
 fn fetch_latest_release() -> Result<GitHubRelease, String> {
@@ -111,7 +111,7 @@ fn fetch_latest_release() -> Result<GitHubRelease, String> {
             "--header",
             "X-GitHub-Api-Version: 2026-03-10",
             "--user-agent",
-            "codex-wake",
+            "open-wake",
             API_LATEST_RELEASE,
         ])
         .output()
@@ -151,7 +151,7 @@ fn download(url: &str, destination: &Path) -> Result<(), String> {
             "--max-time",
             "120",
             "--user-agent",
-            "codex-wake",
+            "open-wake",
             "--output",
         ])
         .arg(destination)
@@ -240,7 +240,7 @@ fn validate_archive(archive: &Path) -> Result<(), String> {
     let entries = listing.lines().collect::<Vec<_>>();
     if entries
         .iter()
-        .filter(|entry| **entry == "codex-wake")
+        .filter(|entry| **entry == "open-wake")
         .count()
         != 1
         || entries.iter().any(|entry| {
@@ -258,7 +258,7 @@ fn extract_binary(archive: &Path, destination: &Path) -> Result<(), String> {
         .arg(archive)
         .arg("-C")
         .arg(destination)
-        .arg("codex-wake")
+        .arg("open-wake")
         .output()
         .map_err(|error| format!("run tar: {error}"))?;
     if !output.status.success() {
@@ -274,13 +274,13 @@ fn validate_candidate(candidate: &Path, expected: &Version) -> Result<(), String
     let metadata =
         fs::metadata(candidate).map_err(|error| format!("inspect downloaded binary: {error}"))?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        return Err("downloaded codex-wake is not executable".to_owned());
+        return Err("downloaded open-wake is not executable".to_owned());
     }
     let output = Command::new(candidate)
         .arg("--version")
         .output()
-        .map_err(|error| format!("run downloaded codex-wake: {error}"))?;
-    let expected_output = format!("codex-wake {expected}");
+        .map_err(|error| format!("run downloaded open-wake: {error}"))?;
+    let expected_output = format!("open-wake {expected}");
     if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != expected_output
     {
         return Err(format!(
@@ -300,7 +300,7 @@ fn atomic_replace_executable(source: &Path, destination: &Path) -> Result<(), St
         destination
             .file_name()
             .and_then(OsStr::to_str)
-            .unwrap_or("codex-wake"),
+            .unwrap_or("open-wake"),
         std::process::id(),
         sequence
     ));
@@ -362,7 +362,7 @@ impl UpdateDir {
             .unwrap_or_default()
             .as_nanos();
         let path = env::temp_dir().join(format!(
-            "codex-wake-update-{}-{timestamp}-{sequence}",
+            "open-wake-update-{}-{timestamp}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path)
@@ -397,10 +397,10 @@ mod tests {
     #[test]
     fn cargo_build_artifacts_are_not_self_updated() {
         assert!(is_cargo_target_binary(Path::new(
-            "/project/target/debug/codex-wake"
+            "/project/target/debug/open-wake"
         )));
         assert!(!is_cargo_target_binary(Path::new(
-            "/home/user/.local/bin/codex-wake"
+            "/home/user/.local/bin/open-wake"
         )));
     }
 }

@@ -70,7 +70,7 @@ pub fn doctor(binary: &Path, targets: &[SetupTarget]) -> DoctorReport {
             status: CheckStatus::Fail,
             detail: "no project or user installation was found".to_owned(),
             fix: Some(
-                "run `codex-wake setup --scope project` or `codex-wake setup --scope user`"
+                "run `open-wake setup --scope project` or `open-wake setup --scope user`"
                     .to_owned(),
             ),
         });
@@ -83,7 +83,7 @@ pub fn doctor(binary: &Path, targets: &[SetupTarget]) -> DoctorReport {
 }
 
 fn inspect_release(report: &mut DoctorReport) {
-    if env::var_os("CODEX_WAKE_NO_UPDATE_CHECK").is_some() {
+    if env::var_os("OPEN_WAKE_NO_UPDATE_CHECK").is_some() {
         return;
     }
     match check_for_update() {
@@ -91,15 +91,15 @@ fn inspect_release(report: &mut DoctorReport) {
             name: "release_update".to_owned(),
             status: CheckStatus::Warn,
             detail: format!(
-                "codex-wake {} is available; current version is {}",
+                "open-wake {} is available; current version is {}",
                 update.latest, update.current
             ),
-            fix: Some("run `codex-wake update`".to_owned()),
+            fix: Some("run `open-wake update`".to_owned()),
         }),
         Ok((update, _)) => report.push(DoctorCheck {
             name: "release_update".to_owned(),
             status: CheckStatus::Pass,
-            detail: format!("codex-wake {} is the latest release", update.current),
+            detail: format!("open-wake {} is the latest release", update.current),
             fix: None,
         }),
         Err(error) => report.push(DoctorCheck {
@@ -107,7 +107,7 @@ fn inspect_release(report: &mut DoctorReport) {
             status: CheckStatus::Warn,
             detail: format!("could not check GitHub Releases: {error}"),
             fix: Some(
-                "check the network or set `CODEX_WAKE_NO_UPDATE_CHECK=1` for offline doctor runs"
+                "check the network or set `OPEN_WAKE_NO_UPDATE_CHECK=1` for offline doctor runs"
                     .to_owned(),
             ),
         }),
@@ -128,13 +128,13 @@ fn inspect_binary(binary: &Path, report: &mut DoctorReport) {
             name: "executable".to_owned(),
             status: CheckStatus::Fail,
             detail: format!("{} is not an executable file", binary.display()),
-            fix: Some("reinstall codex-wake with `cargo install --path . --locked`".to_owned()),
+            fix: Some("reinstall open-wake with `cargo install --path . --locked`".to_owned()),
         }),
         Err(error) => report.push(DoctorCheck {
             name: "executable".to_owned(),
             status: CheckStatus::Fail,
             detail: format!("inspect {}: {error}", binary.display()),
-            fix: Some("reinstall codex-wake with `cargo install --path . --locked`".to_owned()),
+            fix: Some("reinstall open-wake with `cargo install --path . --locked`".to_owned()),
         }),
     }
 }
@@ -152,7 +152,7 @@ fn inspect_codex(report: &mut DoctorReport) {
             name: "codex_cli".to_owned(),
             status: CheckStatus::Fail,
             detail: format!("`codex --version` exited with {}", output.status),
-            fix: Some("install or repair Codex CLI, then rerun `codex-wake doctor`".to_owned()),
+            fix: Some("install or repair Codex CLI, then rerun `open-wake doctor`".to_owned()),
         }),
         Err(error) => report.push(DoctorCheck {
             name: "codex_cli".to_owned(),
@@ -214,7 +214,7 @@ fn inspect_protocol(report: &mut DoctorReport) {
             status: CheckStatus::Fail,
             detail: error,
             fix: Some(
-                "rerun with `RUST_BACKTRACE=1 codex-wake doctor` and report the output".to_owned(),
+                "rerun with `RUST_BACKTRACE=1 open-wake doctor` and report the output".to_owned(),
             ),
         }),
     }
@@ -251,12 +251,11 @@ fn inspect_target(target: &SetupTarget, report: &mut DoctorReport) {
         }),
     }
 
-    if target.scope == InstallScope::Project && find_on_path("codex-wake").is_none() {
+    if target.scope == InstallScope::Project && find_on_path("open-wake").is_none() {
         report.push(DoctorCheck {
             name: "project_hook_command".to_owned(),
             status: CheckStatus::Fail,
-            detail: "project hooks use `codex-wake hook`, but `codex-wake` is not on PATH"
-                .to_owned(),
+            detail: "project hooks use `open-wake hook`, but `open-wake` is not on PATH".to_owned(),
             fix: Some("install it with `cargo install --path . --locked`".to_owned()),
         });
     }
@@ -331,7 +330,7 @@ impl DoctorDir {
             .unwrap_or_default()
             .as_nanos();
         let path = env::temp_dir().join(format!(
-            "codex-wake-doctor-{}-{timestamp}-{sequence}",
+            "open-wake-doctor-{}-{timestamp}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path)

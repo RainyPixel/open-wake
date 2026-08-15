@@ -22,7 +22,7 @@ The continuation is the standard Stop-hook response:
 ```json
 {
   "decision": "block",
-  "reason": "codex-wake: condition met ... Continue the task now."
+  "reason": "open-wake: condition met ... Continue the task now."
 }
 ```
 
@@ -36,12 +36,10 @@ The condition authority is local durable state, not a terminal pane. Terminal
 multiplexers are outside the protocol.
 
 Setup owns exactly one command handler identified by the status message
-`codex-wake: waiting for armed condition`. It may replace or remove that handler
+`open-wake: waiting for armed condition`. It may replace or remove that handler
 but preserves other hook events, groups, handlers, and top-level JSON fields.
-The legacy status marker from the initial prototype is recognized only when its
-handler is a command containing `codex-wake`, allowing safe migration.
 
-The embedded skill is installed under the reserved `codex-wake` directory.
+The embedded skill is installed under the reserved `open-wake` directory.
 Setup updates its two known files. Uninstall deletes a known file only when its
 bytes still match the embedded version.
 

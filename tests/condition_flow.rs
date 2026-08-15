@@ -1,4 +1,4 @@
-use codex_wake::{
+use open_wake::{
     ArmRequest, ConditionStatus, HookResult, StopHookInput, arm, cancel, handle_stop_hook, status,
 };
 use std::fs;
@@ -18,7 +18,7 @@ impl TestDir {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "codex-wake-test-{}-{timestamp}-{sequence}",
+            "open-wake-test-{}-{timestamp}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();
@@ -146,7 +146,7 @@ fn invalid_predicate_wakes_codex_with_the_error() {
         request(
             state.as_ref(),
             "thread-error",
-            vec!["definitely-not-a-real-codex-wake-command".into()],
+            vec!["definitely-not-a-real-open-wake-command".into()],
         ),
     )
     .unwrap();

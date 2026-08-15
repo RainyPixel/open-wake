@@ -1,4 +1,4 @@
-use codex_wake::setup::{ChangeKind, SetupTarget, inspect_hook, inspect_skill, setup, uninstall};
+use open_wake::setup::{ChangeKind, SetupTarget, inspect_hook, inspect_skill, setup, uninstall};
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -19,7 +19,7 @@ impl TestDir {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "codex-wake-setup-test-{}-{timestamp}-{sequence}",
+            "open-wake-setup-test-{}-{timestamp}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&path).unwrap();
@@ -138,7 +138,7 @@ fn user_setup_uses_private_hook_file_and_absolute_binary() {
     let root = TestDir::new();
     let home = root.as_ref().join("home");
     let codex_home = root.as_ref().join("codex-home");
-    let binary = root.as_ref().join("bin/codex-wake");
+    let binary = root.as_ref().join("bin/open-wake");
     let target = SetupTarget::user(&home, &codex_home, &binary);
 
     setup(&target, false).unwrap();
@@ -168,8 +168,8 @@ fn cli_setup_doctor_and_uninstall_complete_a_project_lifecycle() {
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&bin).unwrap();
 
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_codex-wake"));
-    symlink(&executable, bin.join("codex-wake")).unwrap();
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_open-wake"));
+    symlink(&executable, bin.join("open-wake")).unwrap();
     let fake_codex = bin.join("codex");
     fs::write(
         &fake_codex,
@@ -189,7 +189,7 @@ fn cli_setup_doctor_and_uninstall_complete_a_project_lifecycle() {
         .args(["--json"])
         .env("HOME", &home)
         .env("CODEX_HOME", home.join(".codex"))
-        .env("CODEX_WAKE_NO_UPDATE_CHECK", "1")
+        .env("OPEN_WAKE_NO_UPDATE_CHECK", "1")
         .env("PATH", &path)
         .output()
         .unwrap();
@@ -205,7 +205,7 @@ fn cli_setup_doctor_and_uninstall_complete_a_project_lifecycle() {
         .arg("--json")
         .env("HOME", &home)
         .env("CODEX_HOME", home.join(".codex"))
-        .env("CODEX_WAKE_NO_UPDATE_CHECK", "1")
+        .env("OPEN_WAKE_NO_UPDATE_CHECK", "1")
         .env("PATH", &path)
         .output()
         .unwrap();
@@ -235,7 +235,7 @@ fn cli_setup_doctor_and_uninstall_complete_a_project_lifecycle() {
         .unwrap();
     assert!(uninstall_output.status.success());
     assert!(!project.join(".codex/hooks.json").exists());
-    assert!(!project.join(".agents/skills/codex-wake").exists());
+    assert!(!project.join(".agents/skills/open-wake").exists());
 
     let user_setup = Command::new(&executable)
         .args(["setup", "--scope", "user"])
@@ -257,7 +257,7 @@ fn cli_setup_doctor_and_uninstall_complete_a_project_lifecycle() {
         .arg("--json")
         .env("HOME", &home)
         .env("CODEX_HOME", home.join(".codex"))
-        .env("CODEX_WAKE_NO_UPDATE_CHECK", "1")
+        .env("OPEN_WAKE_NO_UPDATE_CHECK", "1")
         .env("PATH", &path)
         .output()
         .unwrap();
@@ -285,7 +285,7 @@ fn update_check_reports_a_new_release_without_modifying_the_binary() {
     )
     .unwrap();
     fs::set_permissions(&fake_curl, fs::Permissions::from_mode(0o755)).unwrap();
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_codex-wake"));
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_open-wake"));
     let path = format!(
         "{}:{}",
         bin.display(),

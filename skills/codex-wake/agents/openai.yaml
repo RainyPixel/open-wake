@@ -1,4 +1,0 @@
-interface:
-  display_name: "Codex Wake"
-  short_description: "Sleep on local conditions without polling"
-  default_prompt: "Use $codex-wake to wait for this long-running task without polling."

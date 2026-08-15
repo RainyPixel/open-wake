@@ -1,8 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use codex_wake::doctor::{CheckStatus, DoctorReport, doctor};
-use codex_wake::setup::{ChangeKind, InstallScope, SetupReport, SetupTarget, setup, uninstall};
-use codex_wake::update::{UpdateReport, check_for_update, install_release};
-use codex_wake::{
+use open_wake::doctor::{CheckStatus, DoctorReport, doctor};
+use open_wake::setup::{ChangeKind, InstallScope, SetupReport, SetupTarget, setup, uninstall};
+use open_wake::update::{UpdateReport, check_for_update, install_release};
+use open_wake::{
     ArmRequest, StopHookInput, arm, cancel, current_session_id, default_state_dir,
     handle_stop_hook, hook_config, hook_output, status,
 };
@@ -34,7 +34,7 @@ enum Commands {
     Setup(InstallArgs),
     /// Check Codex, the wake protocol, hook configuration, and skill installation.
     Doctor(DoctorArgs),
-    /// Remove only files and hook entries managed by codex-wake.
+    /// Remove only files and hook entries managed by open-wake.
     Uninstall(InstallArgs),
     /// Check for a new GitHub release and optionally replace this executable.
     Update(UpdateArgs),
@@ -163,7 +163,7 @@ fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(error) => {
-            eprintln!("codex-wake: {error}");
+            eprintln!("open-wake: {error}");
             ExitCode::FAILURE
         }
     }
@@ -294,11 +294,11 @@ fn run(cli: Cli) -> Result<bool, String> {
             if !args.yes {
                 if !io::stdin().is_terminal() {
                     return Err(
-                        "an update is available; rerun `codex-wake update --yes` to install it"
+                        "an update is available; rerun `open-wake update --yes` to install it"
                             .to_owned(),
                     );
                 }
-                print!("Install codex-wake {} now? [y/N] ", report.latest);
+                print!("Install open-wake {} now? [y/N] ", report.latest);
                 io::stdout()
                     .flush()
                     .map_err(|error| format!("flush update prompt: {error}"))?;
@@ -315,7 +315,7 @@ fn run(cli: Cli) -> Result<bool, String> {
                 .map_err(|error| format!("resolve current executable: {error}"))?;
             install_release(&release, &executable)?;
             println!(
-                "updated codex-wake to {}; run `codex-wake doctor` and refresh each installed scope with `codex-wake setup --scope ...`",
+                "updated open-wake to {}; run `open-wake doctor` and refresh each installed scope with `open-wake setup --scope ...`",
                 report.latest
             );
         }
@@ -451,7 +451,7 @@ fn print_update_report(report: &UpdateReport, json: bool) -> Result<(), String> 
         );
     } else {
         println!(
-            "codex-wake {} is current (latest release: {})",
+            "open-wake {} is current (latest release: {})",
             report.current, report.latest
         );
     }

@@ -91,13 +91,13 @@ struct CheckResult {
 }
 
 pub fn default_state_dir() -> PathBuf {
-    if let Some(path) = env::var_os("CODEX_WAKE_STATE_DIR") {
+    if let Some(path) = env::var_os("OPEN_WAKE_STATE_DIR") {
         return PathBuf::from(path);
     }
     if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(path).join("codex-wake");
+        return PathBuf::from(path).join("open-wake");
     }
-    env::temp_dir().join(format!("codex-wake-{}", current_user_name()))
+    env::temp_dir().join(format!("open-wake-{}", current_user_name()))
 }
 
 pub fn current_session_id(explicit: Option<String>) -> Result<String, String> {
@@ -301,7 +301,7 @@ fn run_check(
     let mut child = Command::new(&condition.command[0])
         .args(&condition.command[1..])
         .current_dir(&condition.cwd)
-        .env("CODEX_WAKE_CONDITION_ID", &condition.id)
+        .env("OPEN_WAKE_CONDITION_ID", &condition.id)
         .stdout(Stdio::from(output))
         .stderr(Stdio::from(error_output))
         .process_group(0)
@@ -366,7 +366,7 @@ fn format_continuation(condition: &Condition) -> String {
         _ => "condition resolved",
     };
     let mut message = format!(
-        "codex-wake: {outcome} for `{label}` after {} ({} checks). Continue the task now. Predicate: `{command}`. Last exit code: {exit_code}.",
+        "open-wake: {outcome} for `{label}` after {} ({} checks). Continue the task now. Predicate: `{command}`. Last exit code: {exit_code}.",
         humantime::format_duration(Duration::from_millis(elapsed_ms)),
         condition.attempts,
     );

@@ -40,19 +40,19 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          asset="codex-wake-${{ matrix.target }}.tar.gz"
+          asset="open-wake-${{ matrix.target }}.tar.gz"
           mkdir staging
-          cp "target/${{ matrix.target }}/release/codex-wake" staging/codex-wake
+          cp "target/${{ matrix.target }}/release/open-wake" staging/open-wake
           cp README.md LICENSE staging/
-          chmod 0755 staging/codex-wake
-          tar -C staging -czf "$asset" codex-wake README.md LICENSE
+          chmod 0755 staging/open-wake
+          tar -C staging -czf "$asset" open-wake README.md LICENSE
           shasum -a 256 "$asset" >"$asset.sha256"
       - uses: actions/upload-artifact@v7
         with:
-          name: codex-wake-${{ matrix.target }}
+          name: open-wake-${{ matrix.target }}
           path: |
-            codex-wake-${{ matrix.target }}.tar.gz
-            codex-wake-${{ matrix.target }}.tar.gz.sha256
+            open-wake-${{ matrix.target }}.tar.gz
+            open-wake-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
 
   publish:
