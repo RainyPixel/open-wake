@@ -8,21 +8,22 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const REPOSITORY: &str = "RainyPixel/open-wake";
 const API_LATEST_RELEASE: &str =
     "https://api.github.com/repos/RainyPixel/open-wake/releases/latest";
 const CHECKSUMS_ASSET: &str = "SHA256SUMS";
+const UPDATE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GitHubAsset {
     name: String,
     browser_download_url: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
     html_url: String,
@@ -35,6 +36,13 @@ pub struct UpdateReport {
     pub latest: String,
     pub update_available: bool,
     pub release_url: String,
+    pub cached: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedRelease {
+    checked_at_ms: u64,
+    release: GitHubRelease,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +53,19 @@ pub struct AvailableRelease {
 
 pub fn check_for_update() -> Result<(UpdateReport, AvailableRelease), String> {
     let release = fetch_latest_release()?;
+    build_report(release, false)
+}
+
+pub fn check_for_update_cached() -> Result<(UpdateReport, AvailableRelease), String> {
+    let cache_path = update_cache_path();
+    let (release, cached) = cached_or_fetch(&cache_path, now_ms(), fetch_latest_release)?;
+    build_report(release, cached)
+}
+
+fn build_report(
+    release: GitHubRelease,
+    cached: bool,
+) -> Result<(UpdateReport, AvailableRelease), String> {
     let latest = parse_tag(&release.tag_name)?;
     let current = Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|error| format!("parse current version: {error}"))?;
@@ -53,6 +74,7 @@ pub fn check_for_update() -> Result<(UpdateReport, AvailableRelease), String> {
         latest: latest.to_string(),
         update_available: latest > current,
         release_url: release.html_url.clone(),
+        cached,
     };
     Ok((
         report,
@@ -61,6 +83,93 @@ pub fn check_for_update() -> Result<(UpdateReport, AvailableRelease), String> {
             version: latest,
         },
     ))
+}
+
+fn update_cache_path() -> PathBuf {
+    if let Some(path) = env::var_os("OPEN_WAKE_CACHE_DIR") {
+        return PathBuf::from(path).join("latest-release.json");
+    }
+    if let Some(path) = env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(path).join("open-wake/latest-release.json");
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home).join(".cache/open-wake/latest-release.json");
+    }
+    env::temp_dir().join(format!(
+        "open-wake-{}-latest-release.json",
+        std::process::id()
+    ))
+}
+
+fn cached_or_fetch<F>(
+    path: &Path,
+    observed_at_ms: u64,
+    fetch: F,
+) -> Result<(GitHubRelease, bool), String>
+where
+    F: FnOnce() -> Result<GitHubRelease, String>,
+{
+    if let Ok(bytes) = fs::read(path)
+        && let Ok(cached) = serde_json::from_slice::<CachedRelease>(&bytes)
+        && observed_at_ms.saturating_sub(cached.checked_at_ms)
+            <= UPDATE_CACHE_TTL.as_millis() as u64
+    {
+        return Ok((cached.release, true));
+    }
+
+    let release = fetch()?;
+    let cached = CachedRelease {
+        checked_at_ms: observed_at_ms,
+        release: release.clone(),
+    };
+    let _ = write_update_cache(path, &cached);
+    Ok((release, false))
+}
+
+fn write_update_cache(path: &Path, cached: &CachedRelease) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("update cache path {} has no parent", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("create update cache {}: {error}", parent.display()))?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("secure update cache {}: {error}", parent.display()))?;
+    let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".latest-release.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let mut bytes = serde_json::to_vec_pretty(cached)
+        .map_err(|error| format!("serialize update cache: {error}"))?;
+    bytes.push(b'\n');
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| format!("create update cache {}: {error}", temporary.display()))?;
+        file.write_all(&bytes)
+            .map_err(|error| format!("write update cache {}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("sync update cache {}: {error}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .map_err(|error| format!("replace update cache {}: {error}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 pub fn install_release(release: &AvailableRelease, executable: &Path) -> Result<(), String> {
@@ -402,5 +511,36 @@ mod tests {
         assert!(!is_cargo_target_binary(Path::new(
             "/home/user/.local/bin/open-wake"
         )));
+    }
+
+    fn release(tag: &str) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag.to_owned(),
+            html_url: format!("https://example.invalid/{tag}"),
+            assets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn update_cache_is_reused_for_24_hours_then_refreshed() {
+        let workspace = UpdateDir::new().unwrap();
+        let path = workspace.as_ref().join("cache/latest-release.json");
+        let now = 1_000_000_000;
+
+        let (first, cached) = cached_or_fetch(&path, now, || Ok(release("v1.0.0"))).unwrap();
+        assert_eq!(first.tag_name, "v1.0.0");
+        assert!(!cached);
+
+        let (second, cached) = cached_or_fetch(&path, now + 1_000, || {
+            panic!("fresh cache should avoid the network")
+        })
+        .unwrap();
+        assert_eq!(second.tag_name, "v1.0.0");
+        assert!(cached);
+
+        let expired = now + UPDATE_CACHE_TTL.as_millis() as u64 + 1;
+        let (third, cached) = cached_or_fetch(&path, expired, || Ok(release("v2.0.0"))).unwrap();
+        assert_eq!(third.tag_name, "v2.0.0");
+        assert!(!cached);
     }
 }

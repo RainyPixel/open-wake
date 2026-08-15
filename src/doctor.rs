@@ -1,6 +1,7 @@
 use crate::setup::{InstallScope, SetupTarget, inspect_hook, inspect_skill};
-use crate::update::check_for_update;
+use crate::update::check_for_update_cached;
 use crate::{ArmRequest, ConditionStatus, StopHookInput, arm, handle_stop_hook, status};
+use crate::{job, job::JobState};
 use serde::Serialize;
 use std::env;
 use std::fs;
@@ -57,11 +58,12 @@ impl Default for DoctorReport {
     }
 }
 
-pub fn doctor(binary: &Path, targets: &[SetupTarget]) -> DoctorReport {
+pub fn doctor(binary: &Path, targets: &[SetupTarget], job_root: &Path) -> DoctorReport {
     let mut report = DoctorReport::new();
     inspect_binary(binary, &mut report);
     inspect_codex(&mut report);
     inspect_protocol(&mut report);
+    inspect_jobs(job_root, &mut report);
     inspect_release(&mut report);
 
     if targets.is_empty() {
@@ -86,20 +88,26 @@ fn inspect_release(report: &mut DoctorReport) {
     if env::var_os("OPEN_WAKE_NO_UPDATE_CHECK").is_some() {
         return;
     }
-    match check_for_update() {
+    match check_for_update_cached() {
         Ok((update, _)) if update.update_available => report.push(DoctorCheck {
             name: "release_update".to_owned(),
             status: CheckStatus::Warn,
             detail: format!(
-                "open-wake {} is available; current version is {}",
-                update.latest, update.current
+                "open-wake {} is available; current version is {}{}",
+                update.latest,
+                update.current,
+                if update.cached { " (cached check)" } else { "" }
             ),
             fix: Some("run `open-wake update`".to_owned()),
         }),
         Ok((update, _)) => report.push(DoctorCheck {
             name: "release_update".to_owned(),
             status: CheckStatus::Pass,
-            detail: format!("open-wake {} is the latest release", update.current),
+            detail: format!(
+                "open-wake {} is the latest release{}",
+                update.current,
+                if update.cached { " (cached check)" } else { "" }
+            ),
             fix: None,
         }),
         Err(error) => report.push(DoctorCheck {
@@ -110,6 +118,56 @@ fn inspect_release(report: &mut DoctorReport) {
                 "check the network or set `OPEN_WAKE_NO_UPDATE_CHECK=1` for offline doctor runs"
                     .to_owned(),
             ),
+        }),
+    }
+}
+
+fn inspect_jobs(job_root: &Path, report: &mut DoctorReport) {
+    match job::list(job_root) {
+        Ok(jobs) => {
+            let stale = jobs
+                .iter()
+                .filter(|job| job.state == JobState::Stale)
+                .collect::<Vec<_>>();
+            if stale.is_empty() {
+                let active = jobs
+                    .iter()
+                    .filter(|job| matches!(job.state, JobState::Starting | JobState::Running))
+                    .count();
+                report.push(DoctorCheck {
+                    name: "job_supervisors".to_owned(),
+                    status: CheckStatus::Pass,
+                    detail: format!(
+                        "{} recorded jobs, {active} active, no stale supervisor heartbeats",
+                        jobs.len()
+                    ),
+                    fix: None,
+                });
+            } else {
+                let detail = stale
+                    .iter()
+                    .map(|job| format!("{} ({})", job.id, job.log_path.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                report.push(DoctorCheck {
+                    name: "job_supervisors".to_owned(),
+                    status: CheckStatus::Warn,
+                    detail: format!(
+                        "stale supervisor heartbeat for {}; a child command may still be running",
+                        detail
+                    ),
+                    fix: Some(
+                        "inspect the recorded log and process IDs before stopping anything; doctor never kills or deletes jobs"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+        Err(error) => report.push(DoctorCheck {
+            name: "job_supervisors".to_owned(),
+            status: CheckStatus::Warn,
+            detail: format!("could not inspect {}: {error}", job_root.display()),
+            fix: Some("inspect the job directory permissions and JSON records".to_owned()),
         }),
     }
 }
@@ -286,6 +344,8 @@ fn protocol_smoke_test() -> Result<(), String> {
             timeout: Duration::from_secs(2),
             interval: Duration::from_millis(50),
             check_timeout: Duration::from_secs(1),
+            check_every: None,
+            job: None,
         },
     )?;
     let result = handle_stop_hook(
@@ -348,5 +408,42 @@ impl AsRef<Path> for DoctorDir {
 impl Drop for DoctorDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_jobs_are_warnings_and_are_not_removed() {
+        let workspace = DoctorDir::new().unwrap();
+        let root = workspace.as_ref().join("jobs");
+        let spec = job::prepare(
+            &root,
+            "thread".to_owned(),
+            Some("stale build".to_owned()),
+            workspace.as_ref().to_owned(),
+            vec!["true".to_owned()],
+        )
+        .unwrap();
+        let spec_path = root.join(&spec.id).join("job.json");
+        let mut stored: job::JobSpec =
+            serde_json::from_slice(&fs::read(&spec_path).unwrap()).unwrap();
+        stored.created_at_ms = 0;
+        fs::write(&spec_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+
+        let mut report = DoctorReport::new();
+        inspect_jobs(&root, &mut report);
+
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "job_supervisors")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains(&spec.id));
+        assert!(spec_path.exists());
+        assert!(report.ok);
     }
 }

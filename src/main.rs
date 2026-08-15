@@ -1,11 +1,13 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use open_wake::doctor::{CheckStatus, DoctorReport, doctor};
+use open_wake::job::{self, JobSnapshot};
 use open_wake::setup::{ChangeKind, InstallScope, SetupReport, SetupTarget, setup, uninstall};
 use open_wake::update::{UpdateReport, check_for_update, install_release};
 use open_wake::{
-    ArmRequest, StopHookInput, arm, cancel, current_session_id, default_state_dir,
+    ArmRequest, Condition, StopHookInput, arm, cancel, current_session_id, default_state_dir,
     handle_stop_hook, hook_config, hook_output, status,
 };
+use serde::Serialize;
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +23,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Run one local command under a detached supervisor and wake Codex when it ends.
+    Run(RunArgs),
     /// Arm one condition for the current Codex session and return immediately.
     Arm(ArmArgs),
     /// Codex Stop hook entry point. Reads the hook event as JSON from stdin.
@@ -28,6 +32,8 @@ enum Commands {
     Hook(StateArgs),
     /// Show the condition for a Codex session.
     Status(SessionArgs),
+    /// Print the absolute combined stdout/stderr log path for a supervised job.
+    Logs(LogsArgs),
     /// Request cancellation of the active condition.
     Cancel(SessionArgs),
     /// Install or update the Stop hook and Codex skill.
@@ -40,6 +46,12 @@ enum Commands {
     Update(UpdateArgs),
     /// Print the Codex hooks.json fragment for this executable.
     HookConfig,
+    /// Detached job supervisor entry point.
+    #[command(hide = true)]
+    Supervise(SuperviseArgs),
+    /// Predicate used by run to detect a terminal job state.
+    #[command(hide = true)]
+    JobReady(JobReadyArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -90,6 +102,10 @@ struct DoctorArgs {
     /// Emit a machine-readable report.
     #[arg(long)]
     json: bool,
+
+    /// Override the persistent supervised-job directory.
+    #[arg(long)]
+    job_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -139,6 +155,45 @@ struct ArmArgs {
 }
 
 #[derive(Debug, Args)]
+struct RunArgs {
+    /// Human-readable job name included in continuation prompts.
+    #[arg(long)]
+    label: Option<String>,
+
+    /// Wake at this deadline even if the command is still running.
+    #[arg(long, default_value = "1h", value_parser = parse_duration)]
+    timeout: Duration,
+
+    /// Also wake periodically without restarting the command.
+    #[arg(long, value_parser = parse_duration)]
+    check_every: Option<Duration>,
+
+    /// Delay between lightweight job-state checks.
+    #[arg(long, default_value = "5s", value_parser = parse_duration)]
+    interval: Duration,
+
+    /// Override CODEX_THREAD_ID.
+    #[arg(long)]
+    thread: Option<String>,
+
+    /// Override the runtime condition directory.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// Override the persistent supervised-job directory.
+    #[arg(long)]
+    job_dir: Option<PathBuf>,
+
+    /// Emit a machine-readable launch report.
+    #[arg(long)]
+    json: bool,
+
+    /// Command to supervise.
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 struct StateArgs {
     #[arg(long)]
     state_dir: Option<PathBuf>,
@@ -158,6 +213,57 @@ struct SessionArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct LogsArgs {
+    /// Job ID. Defaults to the job attached to the current session condition.
+    job: Option<String>,
+
+    /// Override CODEX_THREAD_ID when JOB is omitted.
+    #[arg(long)]
+    thread: Option<String>,
+
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// Override the persistent supervised-job directory when JOB is provided.
+    #[arg(long)]
+    job_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct SuperviseArgs {
+    #[arg(long)]
+    job_path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct JobReadyArgs {
+    #[arg(long)]
+    job_dir: PathBuf,
+
+    #[arg(long)]
+    job: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RunReport {
+    condition_id: String,
+    job_id: String,
+    supervisor_pid: u32,
+    log_path: PathBuf,
+    timeout_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check_every_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusReport {
+    #[serde(flatten)]
+    condition: Condition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_status: Option<JobSnapshot>,
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(true) => ExitCode::SUCCESS,
@@ -171,6 +277,83 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<bool, String> {
     match cli.command {
+        Commands::Run(args) => {
+            let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
+            let job_root = args.job_dir.unwrap_or_else(job::default_job_root);
+            let session_id = current_session_id(args.thread)?;
+            let cwd =
+                env::current_dir().map_err(|error| format!("read current directory: {error}"))?;
+            let binary = env::current_exe()
+                .map_err(|error| format!("resolve current executable: {error}"))?;
+            let spec = job::prepare(
+                &job_root,
+                session_id.clone(),
+                args.label.clone(),
+                cwd.clone(),
+                args.command,
+            )?;
+            let job_reference = job::reference(&job_root, &spec)?;
+            let predicate = vec![
+                binary.display().to_string(),
+                "job-ready".to_owned(),
+                "--job-dir".to_owned(),
+                job_reference.root.display().to_string(),
+                "--job".to_owned(),
+                spec.id.clone(),
+            ];
+            let condition = match arm(
+                &state_dir,
+                ArmRequest {
+                    session_id,
+                    label: args.label,
+                    cwd,
+                    command: predicate,
+                    timeout: args.timeout,
+                    interval: args.interval,
+                    check_timeout: Duration::from_secs(5),
+                    check_every: args.check_every,
+                    job: Some(job_reference.clone()),
+                },
+            ) {
+                Ok(condition) => condition,
+                Err(error) => {
+                    job::discard_prepared(&job_root, &spec.id);
+                    return Err(error);
+                }
+            };
+            let supervisor_pid = match job::spawn_supervisor(&binary, &job_reference.root, &spec.id)
+            {
+                Ok(pid) => pid,
+                Err(error) => {
+                    job::record_spawn_failure(&job_reference.root, &spec.id, &error);
+                    return Err(error);
+                }
+            };
+            let report = RunReport {
+                condition_id: condition.id,
+                job_id: spec.id,
+                supervisor_pid,
+                log_path: spec.log_path,
+                timeout_ms: args.timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                check_every_ms: args
+                    .check_every
+                    .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX)),
+            };
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|error| format!("serialize run report: {error}"))?
+                );
+            } else {
+                println!(
+                    "started job {} (supervisor {}); log: {}; finish the Codex turn to wait",
+                    report.job_id,
+                    report.supervisor_pid,
+                    report.log_path.display()
+                );
+            }
+        }
         Commands::Arm(args) => {
             let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
             let session_id = current_session_id(args.thread)?;
@@ -185,6 +368,8 @@ fn run(cli: Cli) -> Result<bool, String> {
                     timeout: args.timeout,
                     interval: args.interval,
                     check_timeout: args.check_timeout,
+                    check_every: None,
+                    job: None,
                 },
             )?;
             println!(
@@ -216,11 +401,19 @@ fn run(cli: Cli) -> Result<bool, String> {
                 println!("no condition for Codex session {session_id}");
                 return Ok(true);
             };
+            let job_snapshot = condition
+                .job
+                .as_ref()
+                .map(|reference| job::snapshot(&reference.root, &reference.id))
+                .transpose()?;
             if args.json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&condition)
-                        .map_err(|error| format!("serialize condition: {error}"))?
+                    serde_json::to_string_pretty(&StatusReport {
+                        condition,
+                        job_status: job_snapshot,
+                    })
+                    .map_err(|error| format!("serialize status: {error}"))?
                 );
             } else {
                 println!(
@@ -230,7 +423,28 @@ fn run(cli: Cli) -> Result<bool, String> {
                     condition.attempts,
                     condition.last_exit_code
                 );
+                if let Some(job) = job_snapshot {
+                    println!("{}", job.summary());
+                }
             }
+        }
+        Commands::Logs(args) => {
+            let (root, id) = if let Some(id) = args.job {
+                (args.job_dir.unwrap_or_else(job::default_job_root), id)
+            } else {
+                let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
+                let session_id = current_session_id(args.thread)?;
+                let condition = status(&state_dir, &session_id)?
+                    .ok_or_else(|| format!("no condition for Codex session {session_id}"))?;
+                let reference = condition.job.ok_or_else(|| {
+                    format!(
+                        "condition {} is not attached to a supervised job",
+                        condition.id
+                    )
+                })?;
+                (reference.root, reference.id)
+            };
+            println!("{}", job::log_path(&root, &id)?.display());
         }
         Commands::Cancel(args) => {
             let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
@@ -272,7 +486,8 @@ fn run(cli: Cli) -> Result<bool, String> {
                         .collect()
                 }
             };
-            let report = doctor(&binary, &targets);
+            let job_root = args.job_dir.unwrap_or_else(job::default_job_root);
+            let report = doctor(&binary, &targets, &job_root);
             print_doctor_report(&report, args.json)?;
             return Ok(report.ok);
         }
@@ -327,6 +542,14 @@ fn run(cli: Cli) -> Result<bool, String> {
                 serde_json::to_string_pretty(&hook_config(&binary))
                     .map_err(|error| format!("serialize hook config: {error}"))?
             );
+        }
+        Commands::Supervise(args) => {
+            job::supervise(&args.job_path)?;
+        }
+        Commands::JobReady(args) => {
+            let snapshot = job::snapshot(&args.job_dir, &args.job)?;
+            println!("{}", snapshot.summary());
+            return Ok(snapshot.is_ready());
         }
     }
     Ok(true)

@@ -312,3 +312,61 @@ fn update_check_reports_a_new_release_without_modifying_the_binary() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--yes"));
 }
+
+#[test]
+fn doctor_reuses_update_cache_but_explicit_check_is_fresh() {
+    let root = TestDir::new();
+    let project = root.as_ref().join("project");
+    let bin = root.as_ref().join("bin");
+    let count = root.as_ref().join("curl-count");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let fake_codex = bin.join("codex");
+    fs::write(
+        &fake_codex,
+        "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'codex-cli test' ;;\n  features) echo 'hooks stable true' ;;\n  *) exit 2 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_curl = bin.join("curl");
+    fs::write(
+        &fake_curl,
+        format!(
+            "#!/bin/sh\nprintf x >>'{}'\nprintf '%s\\n' '{{\"tag_name\":\"v9.0.0\",\"html_url\":\"https://example.test/v9.0.0\",\"assets\":[]}}'\n",
+            count.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_curl, fs::Permissions::from_mode(0o755)).unwrap();
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_open-wake"));
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    for _ in 0..2 {
+        let output = Command::new(&executable)
+            .args(["doctor", "--scope", "project", "--project-dir"])
+            .arg(&project)
+            .args(["--job-dir"])
+            .arg(root.as_ref().join("jobs"))
+            .arg("--json")
+            .env("HOME", root.as_ref())
+            .env("OPEN_WAKE_CACHE_DIR", root.as_ref().join("cache"))
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(serde_json::from_slice::<Value>(&output.stdout).is_ok());
+    }
+    assert_eq!(fs::read_to_string(&count).unwrap(), "x");
+
+    let output = Command::new(&executable)
+        .args(["update", "--check", "--json"])
+        .env("OPEN_WAKE_CACHE_DIR", root.as_ref().join("cache"))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(fs::read_to_string(&count).unwrap(), "xx");
+}

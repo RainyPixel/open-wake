@@ -1,4 +1,4 @@
 interface:
   display_name: "Open Wake"
-  short_description: "Sleep on local conditions without polling"
-  default_prompt: "Use $open-wake to wait for this long-running task without polling."
+  short_description: "Run long work without Codex polling"
+  default_prompt: "Use $open-wake to run or observe this long-running task without model-side polling."

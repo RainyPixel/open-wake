@@ -3,9 +3,10 @@
 [![CI](https://github.com/RainyPixel/open-wake/actions/workflows/ci.yml/badge.svg)](https://github.com/RainyPixel/open-wake/actions/workflows/ci.yml)
 [![Release](https://github.com/RainyPixel/open-wake/actions/workflows/release.yml/badge.svg)](https://github.com/RainyPixel/open-wake/releases)
 
-`open-wake` lets a Codex CLI turn stop while a local condition is checked.
-When the condition succeeds or reaches its deadline, Codex receives one bounded
-continuation message and resumes the same task.
+`open-wake` lets a Codex CLI turn stop while local work continues. It can run a
+small local command under a detached supervisor or observe an existing durable
+condition. Codex resumes when the work finishes, reaches its deadline, or hits
+an optional progress checkpoint.
 
 It uses the Codex `Stop` hook instead of terminal input injection. The wake-up
 path is therefore the same in a plain terminal, zellij, tmux, or another
@@ -19,22 +20,23 @@ and their acceptance criteria are tracked in [ROADMAP.md](ROADMAP.md).
 Repeated model-side polling wastes tokens and fills the conversation with
 status output. `open-wake` moves that wait into a local hook process:
 
-1. The agent starts work under an independent supervisor.
-2. The agent arms a cheap, read-only predicate and ends its turn.
+1. The agent starts a local job with `open-wake run`, or arms a cheap predicate
+   for work owned by an external supervisor.
+2. The agent ends its turn.
 3. Codex invokes the synchronous `Stop` hook.
-4. `open-wake` checks the predicate locally until it exits `0` or times out.
-5. The hook asks Codex for one continuation with the final result.
+4. `open-wake` checks local state until it is terminal, reaches a checkpoint,
+   or times out.
+5. The hook asks Codex to continue the same task with bounded evidence.
 
-No model request is made while the hook is waiting. Predicate output is bounded
-to 4 KiB and enters the conversation only with the final result.
+No model request is made while the hook is waiting. Model-visible predicate
+output is bounded to 4 KiB. Supervised job logs stay on disk and are never
+copied wholesale into the conversation.
 
 ## Requirements
 
 - Linux or macOS
-- Rust 1.85 or newer to build from source
+- Rust 1.88 or newer to build from source
 - Codex CLI with the `hooks` feature enabled
-- A separately supervised long-running job; `open-wake` observes it but does
-  not keep an ordinary foreground command alive
 
 ## Install
 
@@ -54,8 +56,8 @@ reproducibility matters:
 
 ```console
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/RainyPixel/open-wake/v0.1.0/install.sh \
-  | sh -s -- --version v0.1.0 --scope user
+  https://raw.githubusercontent.com/RainyPixel/open-wake/v0.2.0/install.sh \
+  | sh -s -- --version v0.2.0 --scope user
 ```
 
 From a checkout:
@@ -100,7 +102,9 @@ atomically replaces the current executable. Interactive confirmation is the
 default; `--yes` is intended for explicit automation. Development binaries
 inside `target/debug` or `target/release` are never self-updated.
 
-`doctor` also reports a newer release as a warning. Set
+`doctor` also reports a newer release as a warning and caches a successful
+release lookup for 24 hours. Explicit `open-wake update --check` calls always
+query GitHub. Set
 `OPEN_WAKE_NO_UPDATE_CHECK=1` for a fully offline doctor run. There is no
 background daemon, telemetry, or automatic update installation.
 
@@ -118,17 +122,55 @@ verifies:
 - the current executable;
 - Codex CLI and its hooks feature;
 - an isolated `arm → Stop hook → continuation` protocol smoke test;
+- supervised-job heartbeats, including stale supervisors that may have left a
+  child process running;
 - the latest published GitHub release, unless offline checks are disabled;
 - the selected hook command, timeout, and ownership marker;
 - the installed skill bytes;
 - whether `open-wake` is on `PATH` for project scope.
 
-Doctor never repairs configuration. Failed checks exit non-zero and include an
-exact setup command. Hook trust remains a warning because Codex exposes that
-review as interactive `/hooks` state rather than a stable non-interactive
-readback.
+Doctor never repairs configuration, kills processes, or deletes job records.
+Failed checks exit non-zero and include an exact setup command. A stale job is
+a warning with its ID and log path because heartbeat loss is not proof that the
+child stopped. Hook trust remains a warning because Codex exposes that review
+as interactive `/hooks` state rather than a stable non-interactive readback.
 
-## Use
+## Run a local job
+
+For a small local Unix build, test, or script, use `run`:
+
+```console
+open-wake run \
+  --label "release build" \
+  --timeout 1h \
+  --check-every 15m \
+  -- cargo build --release
+```
+
+`run` returns after launching a detached supervisor. Its exit from the command
+line does not mean the job finished. The job's stdout and stderr share one
+persistent log. Print its absolute path with:
+
+```console
+open-wake logs
+open-wake logs JOB_ID
+```
+
+`logs` intentionally has no tail, search, or follow mode. Use native tools on
+the returned file, for example `tail -n 200 "$(open-wake logs)"` or
+`rg 'error|warning' "$(open-wake logs)"`. This keeps large output outside the
+model context and avoids duplicating standard system tools.
+
+At each `--check-every` checkpoint, the same job and condition remain active.
+Inspect the log, then finish the turn normally to keep waiting. There is no
+`continue` command and the job is never restarted. `open-wake cancel` disables
+future wake-ups but deliberately does not terminate the command.
+
+A zero or non-zero command exit is terminal: both wake Codex, and the exact
+exit code or Unix signal is recorded. A condition deadline also wakes Codex but
+does not kill a still-running job.
+
+## Observe externally supervised work
 
 The predicate must be fast, read-only, and idempotent. Exit `0` means ready; any
 other exit status means not ready yet.
@@ -150,37 +192,28 @@ Useful lifecycle commands:
 ```console
 open-wake status
 open-wake status --json
+open-wake logs
 open-wake cancel
 open-wake update --check
 open-wake uninstall --scope project
 ```
 
-One condition can be active per Codex session. Runtime state lives under
+One condition can be active per Codex session. Ephemeral condition state lives under
 `$XDG_RUNTIME_DIR/open-wake`, or a private user directory under the system temp
 directory when `XDG_RUNTIME_DIR` is unavailable. Override it with
 `OPEN_WAKE_STATE_DIR` or `--state-dir`.
 
-## Starting durable work
+Supervised job records and full logs persist under
+`$XDG_STATE_HOME/open-wake/jobs` or `~/.local/state/open-wake/jobs`. Override
+that location with `OPEN_WAKE_JOB_DIR` or `--job-dir`. Records are not removed
+automatically.
 
-`open-wake` deliberately does not guess how a build, deployment, or remote job
-should be supervised. Use the platform's real authority when one exists:
-systemd, launchd, Kubernetes, CI, a remote build service, or the application's
-job runner. Arm a predicate against a durable status, exit-code file, or
-purpose-built read-only status script.
+## Choosing the execution authority
 
-For a small local Unix job, a detached wrapper can record its exit status:
-
-```console
-job_dir="$(mktemp -d -p /var/tmp open-wake-job.XXXXXX)"
-nohup sh -c 'cargo build --release; printf "%s\n" "$?" >"$1/exit-code"' \
-  sh "$job_dir" >"$job_dir/output.log" 2>&1 </dev/null &
-
-open-wake arm --label "release build" --timeout 1h -- \
-  sh -c 'test -f "$1/exit-code"' sh "$job_dir"
-```
-
-On continuation, inspect `exit-code` and the durable log before deciding whether
-the task succeeded. The existence predicate only means the job finished.
+`run` is a small local Unix supervisor, not a deployment orchestrator. Use the
+platform's real authority for system services, Kubernetes, CI, remote builds,
+deployments, and production jobs. For those, use `arm` against durable status
+or a purpose-built read-only status script.
 
 ## Safety boundary
 
@@ -190,7 +223,11 @@ use a predicate that mutates production, retries an action, or performs cleanup.
 Each predicate runs in its own process group; a per-check timeout kills the
 whole group to avoid leaked descendants.
 
-Condition files are private (`0700` directory, `0600` files). Setup refuses to
+Condition and job directories are private (`0700`) and their records/logs are
+`0600`. The on-disk job log is complete and currently has no automatic size
+limit or retention policy, so choose its state directory with available disk
+space in mind. Command arguments and combined output are persisted; do not put
+credentials in either. Setup refuses to
 replace a symlinked hook file. Uninstall removes only the managed hook entry and
 unchanged embedded skill files; locally modified skill files are retained and
 produce a non-zero exit.

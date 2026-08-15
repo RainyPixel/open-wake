@@ -54,7 +54,60 @@ fn request(cwd: &Path, session_id: &str, command: Vec<String>) -> ArmRequest {
         timeout: Duration::from_secs(2),
         interval: Duration::from_millis(50),
         check_timeout: Duration::from_secs(1),
+        check_every: None,
+        job: None,
     }
+}
+
+#[test]
+fn checkpoint_wakes_without_resolving_or_restarting_the_condition() {
+    let state = TestDir::new();
+    let ready = state.as_ref().join("ready");
+    let attempts = state.as_ref().join("attempts");
+    let mut request = request(
+        state.as_ref(),
+        "thread-checkpoint",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "printf x >>'{}'; test -e '{}'",
+                attempts.display(),
+                ready.display()
+            ),
+        ],
+    );
+    request.timeout = Duration::from_secs(3);
+    request.check_every = Some(Duration::from_millis(150));
+    arm(state.as_ref(), request).unwrap();
+
+    let HookResult::Continue(reason) =
+        handle_stop_hook(state.as_ref(), &input("thread-checkpoint")).unwrap()
+    else {
+        panic!("expected checkpoint continuation");
+    };
+    assert!(reason.contains("progress checkpoint 1"));
+    let condition = status(state.as_ref(), "thread-checkpoint")
+        .unwrap()
+        .unwrap();
+    assert_eq!(condition.status, ConditionStatus::Armed);
+    assert_eq!(condition.checkpoints, 1);
+
+    fs::write(&ready, b"").unwrap();
+    let HookResult::Continue(reason) =
+        handle_stop_hook(state.as_ref(), &input("thread-checkpoint")).unwrap()
+    else {
+        panic!("expected completion continuation");
+    };
+    assert!(reason.contains("condition met"));
+    assert_eq!(
+        status(state.as_ref(), "thread-checkpoint")
+            .unwrap()
+            .unwrap()
+            .status,
+        ConditionStatus::Succeeded
+    );
+    assert!(fs::read_to_string(attempts).unwrap().len() >= 2);
 }
 
 #[test]

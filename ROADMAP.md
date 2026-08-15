@@ -9,10 +9,14 @@ research.
 
 - A terminal-multiplexer-independent Codex `Stop` hook.
 - One durable, session-scoped condition with bounded predicate output.
+- A detached Unix supervisor for small local jobs, exact exit/signal records,
+  persistent combined logs, and a path-only `logs` command.
+- Optional recurring checkpoints that keep the same condition and job active.
 - Success, timeout, failure, replacement, and cancellation outcomes.
-- Per-project or per-user setup, read-only doctor checks, and safe uninstall.
+- Per-project or per-user setup, read-only doctor checks including stale job
+  heartbeats, and safe uninstall.
 - Checksummed native release archives, one-shot installation, self-update, and
-  update notices from `doctor`.
+  24-hour cached update notices from `doctor`.
 
 ## Agent adapters
 
@@ -44,17 +48,17 @@ instead of guessed abstractions.
 
 ## Reliability and ergonomics
 
-- Add an opt-in `open-wake run` helper for small local jobs. It should detach
-  safely, preserve the process-group exit status and a bounded log, and expose
-  a read-only completion predicate. External supervisors remain the authority
-  for CI, deployments, containers, and production jobs.
-- Detect and explain stale conditions after crashes or host restarts, with an
-  explicit garbage-collection command rather than silent deletion.
+- Add explicit, safety-checked job termination semantics. Keep notification
+  cancellation separate from process termination, and refuse unsafe PID reuse
+  guesses after a stale heartbeat.
+- Add explicit job retention and garbage collection with age/size previews;
+  never silently delete logs. Consider optional log rotation or a disk budget.
+- Detect stale condition records as well as stale supervised jobs after crashes
+  or host restarts.
 - Add a machine-readable event schema for arm, check, wake, timeout, and cancel
   outcomes while keeping model-visible output bounded.
-- Cache update checks for a configurable interval so repeated `doctor` runs do
-  not require a GitHub request. Keep checks disableable and install updates only
-  after explicit user action.
+- Add adaptive checkpoints based on log/activity changes after fixed periodic
+  checkpoints have real-world usage evidence.
 - Add shell completions and man pages after the command surface stabilizes.
 
 ## Distribution and supply chain

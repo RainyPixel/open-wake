@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod doctor;
+pub mod job;
 pub mod setup;
 pub mod update;
 
@@ -20,7 +21,15 @@ pub const HOOK_TIMEOUT_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const MAX_CONDITION_TIMEOUT: Duration = Duration::from_secs(HOOK_TIMEOUT_SECONDS - 60);
 const OUTPUT_LIMIT_BYTES: usize = 4 * 1024;
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MIN_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(100);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobReference {
+    pub id: String,
+    pub root: PathBuf,
+    pub log_path: PathBuf,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +61,14 @@ pub struct Condition {
     pub timeout_ms: u64,
     pub interval_ms: u64,
     pub check_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_every_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_checkpoint_at_ms: Option<u64>,
+    #[serde(default)]
+    pub checkpoints: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobReference>,
     pub status: ConditionStatus,
     pub attempts: u64,
     pub last_exit_code: Option<i32>,
@@ -68,6 +85,8 @@ pub struct ArmRequest {
     pub timeout: Duration,
     pub interval: Duration,
     pub check_timeout: Duration,
+    pub check_every: Option<Duration>,
+    pub job: Option<JobReference>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +143,8 @@ pub fn arm(state_dir: &Path, request: ArmRequest) -> Result<Condition, String> {
         ));
     }
 
+    let created_at_ms = now_ms();
+    let check_every_ms = request.check_every.map(duration_ms);
     let condition = Condition {
         version: 1,
         id: new_condition_id(),
@@ -131,10 +152,14 @@ pub fn arm(state_dir: &Path, request: ArmRequest) -> Result<Condition, String> {
         label: request.label,
         cwd: request.cwd,
         command: request.command,
-        created_at_ms: now_ms(),
+        created_at_ms,
         timeout_ms: duration_ms(request.timeout),
         interval_ms: duration_ms(request.interval),
         check_timeout_ms: duration_ms(request.check_timeout),
+        check_every_ms,
+        next_checkpoint_at_ms: check_every_ms.map(|interval| created_at_ms + interval),
+        checkpoints: 0,
+        job: request.job,
         status: ConditionStatus::Armed,
         attempts: 0,
         last_exit_code: None,
@@ -192,6 +217,16 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
 
     loop {
         if now_ms().saturating_sub(condition.created_at_ms) >= condition.timeout_ms {
+            if let Some(reference) = &condition.job
+                && let Ok(snapshot) = job::snapshot(&reference.root, &reference.id)
+                && snapshot.is_ready()
+            {
+                condition.attempts += 1;
+                condition.last_exit_code = Some(0);
+                condition.last_output = format!("{}\n", snapshot.summary());
+                resolve(&path, &mut condition, ConditionStatus::Succeeded)?;
+                return Ok(HookResult::Continue(format_continuation(&condition)));
+            }
             resolve(&path, &mut condition, ConditionStatus::TimedOut)?;
             return Ok(HookResult::Continue(format_continuation(&condition)));
         }
@@ -233,11 +268,30 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
             return Ok(HookResult::Continue(format_continuation(&condition)));
         }
 
+        let observed_at_ms = now_ms();
+        if condition
+            .next_checkpoint_at_ms
+            .is_some_and(|checkpoint_at_ms| observed_at_ms >= checkpoint_at_ms)
+        {
+            condition.status = ConditionStatus::Armed;
+            condition.checkpoints += 1;
+            condition.next_checkpoint_at_ms = condition
+                .check_every_ms
+                .map(|interval| observed_at_ms.saturating_add(interval));
+            write_condition(&path, &condition).map_err(io_error("record checkpoint"))?;
+            return Ok(HookResult::Continue(format_checkpoint(&condition)));
+        }
+
         write_condition(&path, &condition).map_err(io_error("update condition"))?;
         let remaining_ms = condition
             .timeout_ms
             .saturating_sub(now_ms().saturating_sub(condition.created_at_ms));
-        let sleep_for = Duration::from_millis(condition.interval_ms.min(remaining_ms));
+        let checkpoint_ms = condition
+            .next_checkpoint_at_ms
+            .map(|checkpoint| checkpoint.saturating_sub(now_ms()))
+            .unwrap_or(u64::MAX);
+        let sleep_for =
+            Duration::from_millis(condition.interval_ms.min(remaining_ms).min(checkpoint_ms));
         if !sleep_for.is_zero() {
             thread::sleep(sleep_for);
         }
@@ -277,6 +331,14 @@ fn validate_request(request: &ArmRequest) -> Result<(), String> {
     }
     if request.check_timeout.is_zero() {
         return Err("--check-timeout must be greater than zero".to_owned());
+    }
+    if let Some(check_every) = request.check_every {
+        if check_every < MIN_CHECKPOINT_INTERVAL {
+            return Err("--check-every must be at least 100ms".to_owned());
+        }
+        if check_every >= request.timeout {
+            return Err("--check-every must be shorter than --timeout".to_owned());
+        }
     }
     if !request.cwd.is_dir() {
         return Err(format!(
@@ -345,7 +407,7 @@ fn resolve(path: &Path, condition: &mut Condition, status: ConditionStatus) -> R
 }
 
 fn format_continuation(condition: &Condition) -> String {
-    let label = condition.label.as_deref().unwrap_or(&condition.id);
+    let label = condition_label(condition);
     let elapsed_ms = condition
         .resolved_at_ms
         .unwrap_or_else(now_ms)
@@ -370,12 +432,55 @@ fn format_continuation(condition: &Condition) -> String {
         humantime::format_duration(Duration::from_millis(elapsed_ms)),
         condition.attempts,
     );
+    append_job_context(&mut message, condition);
     if !condition.last_output.trim().is_empty() {
         message.push_str("\n\nLast predicate output (bounded):\n```text\n");
         message.push_str(condition.last_output.trim_end());
         message.push_str("\n```");
     }
     message
+}
+
+fn format_checkpoint(condition: &Condition) -> String {
+    let label = condition_label(condition);
+    let mut message = format!(
+        "open-wake: progress checkpoint {} for `{label}` after {} ({} checks). The same condition remains armed; inspect progress now, then finish the turn to keep waiting or run `open-wake cancel` to stop future wake-ups.",
+        condition.checkpoints,
+        humantime::format_duration(Duration::from_millis(
+            now_ms().saturating_sub(condition.created_at_ms)
+        )),
+        condition.attempts,
+    );
+    append_job_context(&mut message, condition);
+    if !condition.last_output.trim().is_empty() {
+        message.push_str("\n\nLast predicate output (bounded):\n```text\n");
+        message.push_str(condition.last_output.trim_end());
+        message.push_str("\n```");
+    }
+    message
+}
+
+fn condition_label(condition: &Condition) -> &str {
+    condition
+        .label
+        .as_deref()
+        .or_else(|| condition.job.as_ref().map(|job| job.id.as_str()))
+        .unwrap_or(&condition.id)
+}
+
+fn append_job_context(message: &mut String, condition: &Condition) {
+    if let Some(job) = &condition.job {
+        message.push_str(&format!(
+            " Job ID: `{}`. Full combined stdout/stderr log: `{}`. Use native tools such as `tail` or `rg` to inspect it; open-wake will not print the full log.",
+            job.id,
+            job.log_path.display()
+        ));
+        if condition.status == ConditionStatus::TimedOut {
+            message.push_str(
+                " The open-wake deadline does not terminate the supervised command; inspect the job before deciding what to stop.",
+            );
+        }
+    }
 }
 
 fn condition_path(state_dir: &Path, session_id: &str) -> PathBuf {
