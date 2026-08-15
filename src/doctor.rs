@@ -72,6 +72,7 @@ pub fn doctor(
     inspect_codex(&mut report);
     inspect_state_directory(state_dir, &mut report);
     inspect_protocol(&mut report);
+    inspect_current_condition(state_dir, &mut report);
     inspect_jobs(job_root, &mut report);
     inspect_release(&mut report);
 
@@ -114,6 +115,72 @@ fn inspect_state_directory(state_dir: &Path, report: &mut DoctorReport) {
             "choose a writable directory with OPEN_WAKE_STATE_DIR or --state-dir".to_owned()
         }),
     });
+}
+
+fn inspect_current_condition(state_dir: &Path, report: &mut DoctorReport) {
+    let Ok(session_id) = env::var("CODEX_THREAD_ID") else {
+        return;
+    };
+    inspect_condition_at(state_dir, &session_id, observed_at_ms(), report);
+}
+
+fn inspect_condition_at(
+    state_dir: &Path,
+    session_id: &str,
+    observed_at_ms: u64,
+    report: &mut DoctorReport,
+) {
+    match status(state_dir, session_id) {
+        Ok(Some(condition)) if condition.status.is_active() => {
+            let elapsed_ms = observed_at_ms.saturating_sub(condition.created_at_ms);
+            let expired = elapsed_ms >= condition.timeout_ms;
+            let never_observed = expired && condition.attempts == 0;
+            report.push(DoctorCheck {
+                name: "active_condition".to_owned(),
+                status: if expired {
+                    CheckStatus::Warn
+                } else {
+                    CheckStatus::Pass
+                },
+                detail: if never_observed {
+                    format!(
+                        "condition {} passed its deadline with zero attempts; Codex did not invoke the Stop hook",
+                        condition.id
+                    )
+                } else if expired {
+                    format!(
+                        "condition {} remains {:?} after its deadline ({} attempts)",
+                        condition.id, condition.status, condition.attempts
+                    )
+                } else {
+                    format!(
+                        "condition {} is {:?} ({} attempts)",
+                        condition.id, condition.status, condition.attempts
+                    )
+                },
+                fix: expired.then(|| {
+                    "open `/hooks`, trust the exact command, restart Codex if setup changed, then cancel or re-arm the condition"
+                        .to_owned()
+                }),
+            });
+        }
+        Ok(_) => {}
+        Err(error) => report.push(DoctorCheck {
+            name: "active_condition".to_owned(),
+            status: CheckStatus::Warn,
+            detail: format!("could not inspect the current Codex condition: {error}"),
+            fix: Some("inspect the condition state directory and rerun doctor".to_owned()),
+        }),
+    }
+}
+
+fn observed_at_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn inspect_release(report: &mut DoctorReport) {
@@ -306,7 +373,7 @@ fn inspect_protocol(report: &mut DoctorReport) {
         Ok(()) => report.push(DoctorCheck {
             name: "wake_protocol".to_owned(),
             status: CheckStatus::Pass,
-            detail: "arm, Stop hook, and continuation smoke test passed".to_owned(),
+            detail: "local arm, hook handler, and continuation smoke test passed".to_owned(),
             fix: None,
         }),
         Err(error) => report.push(DoctorCheck {
@@ -486,6 +553,44 @@ mod tests {
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.detail.contains(&spec.id));
         assert!(spec_path.exists());
+        assert!(report.ok);
+    }
+
+    #[test]
+    fn expired_condition_without_attempts_reports_missing_hook_invocation() {
+        let workspace = DoctorDir::new().unwrap();
+        let condition = arm(
+            workspace.as_ref(),
+            ArmRequest {
+                session_id: "thread".to_owned(),
+                label: Some("acceptance".to_owned()),
+                cwd: workspace.as_ref().to_owned(),
+                command: vec!["true".to_owned()],
+                timeout: Duration::from_secs(1),
+                interval: Duration::from_millis(50),
+                check_timeout: Duration::from_millis(50),
+                check_every: None,
+                job: None,
+            },
+        )
+        .unwrap();
+
+        let mut report = DoctorReport::new();
+        inspect_condition_at(
+            workspace.as_ref(),
+            "thread",
+            condition.created_at_ms + condition.timeout_ms,
+            &mut report,
+        );
+
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "active_condition")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("zero attempts"));
+        assert!(check.detail.contains("did not invoke the Stop hook"));
         assert!(report.ok);
     }
 }

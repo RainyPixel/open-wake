@@ -45,6 +45,12 @@ through their own durable authority.
    keeps running. There is no `continue` command.
 5. On terminal continuation, inspect the recorded exit code, signal, timeout,
    or failure before deciding whether the original task succeeded.
+6. If the user returns manually instead of a hook continuation, run
+   `open-wake status --json`. An active condition past its deadline with
+   `attempts: 0` means the Codex host never invoked the `Stop` hook; do not call
+   that an end-to-end success. Run `open-wake cancel` to prevent a later wake,
+   then use `open-wake doctor` and ask the user to review `/hooks`, trust the
+   exact command, and restart Codex if setup changed.
 
 `open-wake cancel` stops future wake-ups but does not terminate a supervised
 command. If a checkpoint reveals incorrect work, cancel notifications only if
