@@ -47,7 +47,8 @@ For `run`, a persistent job directory contains `job.json`, a heartbeat,
 exact exit code or Unix signal. A recent heartbeat proves only that the
 supervisor is observing the child; a stale heartbeat does not prove the child
 stopped. `doctor` therefore reports stale jobs without killing or deleting
-anything.
+anything. The launcher reports success only after seeing the first heartbeat
+or a terminal result from the supervisor.
 
 Setup owns exactly one command handler identified by the status message
 `open-wake: waiting for armed condition`. It may replace or remove that handler

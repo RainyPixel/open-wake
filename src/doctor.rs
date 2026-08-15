@@ -1,6 +1,9 @@
 use crate::setup::{InstallScope, SetupTarget, inspect_hook, inspect_skill};
 use crate::update::check_for_update_cached;
-use crate::{ArmRequest, ConditionStatus, StopHookInput, arm, handle_stop_hook, status};
+use crate::{
+    ArmRequest, ConditionStatus, StopHookInput, arm, directory_can_be_created, handle_stop_hook,
+    status,
+};
 use crate::{job, job::JobState};
 use serde::Serialize;
 use std::env;
@@ -58,10 +61,16 @@ impl Default for DoctorReport {
     }
 }
 
-pub fn doctor(binary: &Path, targets: &[SetupTarget], job_root: &Path) -> DoctorReport {
+pub fn doctor(
+    binary: &Path,
+    targets: &[SetupTarget],
+    state_dir: &Path,
+    job_root: &Path,
+) -> DoctorReport {
     let mut report = DoctorReport::new();
     inspect_binary(binary, &mut report);
     inspect_codex(&mut report);
+    inspect_state_directory(state_dir, &mut report);
     inspect_protocol(&mut report);
     inspect_jobs(job_root, &mut report);
     inspect_release(&mut report);
@@ -82,6 +91,29 @@ pub fn doctor(binary: &Path, targets: &[SetupTarget], job_root: &Path) -> Doctor
         inspect_target(target, &mut report);
     }
     report
+}
+
+fn inspect_state_directory(state_dir: &Path, report: &mut DoctorReport) {
+    let usable = directory_can_be_created(state_dir);
+    report.push(DoctorCheck {
+        name: "condition_state".to_owned(),
+        status: if usable {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        },
+        detail: if usable {
+            format!("writable runtime state directory: {}", state_dir.display())
+        } else {
+            format!(
+                "runtime state directory is not writable: {}",
+                state_dir.display()
+            )
+        },
+        fix: (!usable).then(|| {
+            "choose a writable directory with OPEN_WAKE_STATE_DIR or --state-dir".to_owned()
+        }),
+    });
 }
 
 fn inspect_release(report: &mut DoctorReport) {
@@ -123,6 +155,15 @@ fn inspect_release(report: &mut DoctorReport) {
 }
 
 fn inspect_jobs(job_root: &Path, report: &mut DoctorReport) {
+    if !directory_can_be_created(job_root) {
+        report.push(DoctorCheck {
+            name: "job_supervisors".to_owned(),
+            status: CheckStatus::Fail,
+            detail: format!("job directory is not writable: {}", job_root.display()),
+            fix: Some("choose a writable directory with OPEN_WAKE_JOB_DIR or --job-dir".to_owned()),
+        });
+        return;
+    }
     match job::list(job_root) {
         Ok(jobs) => {
             let stale = jobs
@@ -138,8 +179,9 @@ fn inspect_jobs(job_root: &Path, report: &mut DoctorReport) {
                     name: "job_supervisors".to_owned(),
                     status: CheckStatus::Pass,
                     detail: format!(
-                        "{} recorded jobs, {active} active, no stale supervisor heartbeats",
-                        jobs.len()
+                        "{}: {} recorded jobs, {active} active, no stale supervisor heartbeats",
+                        job_root.display(),
+                        jobs.len(),
                     ),
                     fix: None,
                 });

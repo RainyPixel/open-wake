@@ -56,8 +56,8 @@ reproducibility matters:
 
 ```console
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/RainyPixel/open-wake/v0.2.0/install.sh \
-  | sh -s -- --version v0.2.0 --scope user
+  https://raw.githubusercontent.com/RainyPixel/open-wake/v0.2.1/install.sh \
+  | sh -s -- --version v0.2.1 --scope user
 ```
 
 From a checkout:
@@ -121,6 +121,7 @@ verifies:
 
 - the current executable;
 - Codex CLI and its hooks feature;
+- the selected writable condition and supervised-job directories;
 - an isolated `arm → Stop hook → continuation` protocol smoke test;
 - supervised-job heartbeats, including stale supervisors that may have left a
   child process running;
@@ -147,9 +148,10 @@ open-wake run \
   -- cargo build --release
 ```
 
-`run` returns after launching a detached supervisor. Its exit from the command
-line does not mean the job finished. The job's stdout and stderr share one
-persistent log. Print its absolute path with:
+`run` returns after the detached supervisor acknowledges startup. It reports an
+error instead of claiming success if that acknowledgement never arrives. The
+launcher's exit does not mean the job finished. The job's stdout and stderr
+share one persistent log. Print its absolute path with:
 
 ```console
 open-wake logs
@@ -198,15 +200,18 @@ open-wake update --check
 open-wake uninstall --scope project
 ```
 
-One condition can be active per Codex session. Ephemeral condition state lives under
-`$XDG_RUNTIME_DIR/open-wake`, or a private user directory under the system temp
-directory when `XDG_RUNTIME_DIR` is unavailable. Override it with
-`OPEN_WAKE_STATE_DIR` or `--state-dir`.
+One condition can be active per Codex session. Ephemeral condition state uses
+`$XDG_RUNTIME_DIR/open-wake` when that location is writable. In a restricted
+agent sandbox it falls back to `/tmp/open-wake-$USER`. Override it with
+`OPEN_WAKE_STATE_DIR` or `--state-dir`; explicit overrides are strict and never
+fall back silently.
 
 Supervised job records and full logs persist under
-`$XDG_STATE_HOME/open-wake/jobs` or `~/.local/state/open-wake/jobs`. Override
-that location with `OPEN_WAKE_JOB_DIR` or `--job-dir`. Records are not removed
-automatically.
+`$XDG_STATE_HOME/open-wake/jobs` or `~/.local/state/open-wake/jobs` when the
+selected location is writable. Otherwise they fall back to
+`/var/tmp/open-wake-$USER/jobs`, keeping potentially large logs out of `/tmp`.
+Override that location with `OPEN_WAKE_JOB_DIR` or `--job-dir`; explicit
+overrides are strict. Records are not removed automatically.
 
 ## Choosing the execution authority
 

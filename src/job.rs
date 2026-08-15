@@ -10,10 +10,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const CHILD_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+const SUPERVISOR_START_TIMEOUT: Duration = Duration::from_secs(5);
+const SUPERVISOR_START_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 pub const STALE_AFTER: Duration = Duration::from_secs(30);
 static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
 static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
@@ -124,15 +126,24 @@ pub fn default_job_root() -> PathBuf {
     if let Some(path) = env::var_os("OPEN_WAKE_JOB_DIR") {
         return PathBuf::from(path);
     }
-    if let Some(path) = env::var_os("XDG_STATE_HOME") {
-        return PathBuf::from(path).join("open-wake/jobs");
-    }
-    if let Some(home) = env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/state/open-wake/jobs");
-    }
-    PathBuf::from("/var/tmp")
+    let preferred = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .map(|path| path.join("open-wake/jobs"))
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join(".local/state/open-wake/jobs"))
+        });
+    let fallback = PathBuf::from("/var/tmp")
         .join(format!("open-wake-{}", current_user_name()))
-        .join("jobs")
+        .join("jobs");
+    choose_job_root(preferred, fallback)
+}
+
+fn choose_job_root(preferred: Option<PathBuf>, fallback: PathBuf) -> PathBuf {
+    preferred
+        .filter(|path| crate::directory_can_be_created(path))
+        .unwrap_or(fallback)
 }
 
 pub fn prepare(
@@ -229,10 +240,33 @@ pub fn spawn_supervisor(binary: &Path, root: &Path, id: &str) -> Result<u32, Str
             Ok(())
         });
     }
-    command
+    let mut child = command
         .spawn()
-        .map(|child| child.id())
-        .map_err(|error| format!("start detached job supervisor: {error}"))
+        .map_err(|error| format!("start detached job supervisor: {error}"))?;
+    let pid = child.id();
+    let deadline = Instant::now() + SUPERVISOR_START_TIMEOUT;
+    loop {
+        if directory.join("heartbeat").exists() || directory.join("result.json").exists() {
+            return Ok(pid);
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("observe detached job supervisor startup: {error}"))?
+        {
+            return Err(format!(
+                "detached job supervisor exited with {status} before acknowledging startup"
+            ));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "detached job supervisor did not acknowledge startup within {}",
+                humantime::format_duration(SUPERVISOR_START_TIMEOUT)
+            ));
+        }
+        thread::sleep(SUPERVISOR_START_CHECK_INTERVAL);
+    }
 }
 
 pub fn supervise(directory: &Path) -> Result<(), String> {
@@ -544,5 +578,34 @@ mod tests {
     fn job_ids_cannot_escape_the_job_root() {
         assert!(checked_job_dir(Path::new("/jobs"), "../job").is_err());
         assert!(checked_job_dir(Path::new("/jobs"), "job-123").is_ok());
+    }
+
+    #[test]
+    fn unavailable_state_home_uses_job_fallback() {
+        let root = TestDir::new();
+        let unavailable = root.0.join("not-a-directory");
+        fs::write(&unavailable, b"").unwrap();
+        let fallback = root.0.join("fallback/jobs");
+        let preferred = unavailable.join("open-wake/jobs");
+
+        assert_eq!(choose_job_root(Some(preferred), fallback.clone()), fallback);
+    }
+
+    #[test]
+    fn launcher_rejects_a_supervisor_without_startup_acknowledgement() {
+        let root = TestDir::new();
+        let spec = prepare(
+            &root.0,
+            "thread".to_owned(),
+            Some("build".to_owned()),
+            root.0.clone(),
+            vec!["true".to_owned()],
+        )
+        .unwrap();
+
+        let error = spawn_supervisor(Path::new("/bin/false"), &root.0, &spec.id).unwrap_err();
+
+        assert!(error.contains("before acknowledging startup"));
+        assert!(!root.0.join(&spec.id).join("heartbeat").exists());
     }
 }

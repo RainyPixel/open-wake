@@ -106,6 +106,10 @@ struct DoctorArgs {
     /// Override the persistent supervised-job directory.
     #[arg(long)]
     job_dir: Option<PathBuf>,
+
+    /// Override the runtime condition directory.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -486,8 +490,9 @@ fn run(cli: Cli) -> Result<bool, String> {
                         .collect()
                 }
             };
+            let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
             let job_root = args.job_dir.unwrap_or_else(job::default_job_root);
-            let report = doctor(&binary, &targets, &job_root);
+            let report = doctor(&binary, &targets, &state_dir, &job_root);
             print_doctor_report(&report, args.json)?;
             return Ok(report.ok);
         }

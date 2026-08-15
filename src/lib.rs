@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -113,10 +114,30 @@ pub fn default_state_dir() -> PathBuf {
     if let Some(path) = env::var_os("OPEN_WAKE_STATE_DIR") {
         return PathBuf::from(path);
     }
-    if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(path).join("open-wake");
+    let preferred = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .map(|path| path.join("open-wake"));
+    let fallback = PathBuf::from("/tmp").join(format!("open-wake-{}", current_user_name()));
+    choose_writable_directory(preferred, fallback)
+}
+
+fn choose_writable_directory(preferred: Option<PathBuf>, fallback: PathBuf) -> PathBuf {
+    preferred
+        .filter(|path| directory_can_be_created(path))
+        .unwrap_or(fallback)
+}
+
+pub(crate) fn directory_can_be_created(path: &Path) -> bool {
+    let Some(existing) = path.ancestors().find(|ancestor| ancestor.exists()) else {
+        return false;
+    };
+    if !existing.is_dir() {
+        return false;
     }
-    env::temp_dir().join(format!("open-wake-{}", current_user_name()))
+    let Ok(existing) = CString::new(existing.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::access(existing.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
 }
 
 pub fn current_session_id(explicit: Option<String>) -> Result<String, String> {
@@ -603,5 +624,21 @@ mod tests {
             hook_output(HookResult::Continue("ready".to_owned())),
             json!({"decision": "block", "reason": "ready"})
         );
+    }
+
+    #[test]
+    fn unavailable_runtime_directory_uses_the_writable_fallback() {
+        let root = env::temp_dir().join(format!("open-wake-state-choice-{}", new_condition_id()));
+        fs::create_dir(&root).unwrap();
+        let unavailable = root.join("not-a-directory");
+        fs::write(&unavailable, b"").unwrap();
+        let fallback = root.join("fallback");
+
+        assert_eq!(
+            choose_writable_directory(Some(unavailable.join("open-wake")), fallback.clone()),
+            fallback
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

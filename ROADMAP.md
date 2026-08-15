@@ -14,7 +14,8 @@ research.
 - Optional recurring checkpoints that keep the same condition and job active.
 - Success, timeout, failure, replacement, and cancellation outcomes.
 - Per-project or per-user setup, read-only doctor checks including stale job
-  heartbeats, and safe uninstall.
+  heartbeats and writable state roots, sandbox-aware `/tmp` and `/var/tmp`
+  fallbacks, and safe uninstall.
 - Checksummed native release archives, one-shot installation, self-update, and
   24-hour cached update notices from `doctor`.
 
