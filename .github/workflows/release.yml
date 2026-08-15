@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Validate tag
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          test "v$version" = "$GITHUB_REF_NAME"
+      - name: Test
+        run: cargo test --locked
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Package
+        shell: bash
+        run: |
+          asset="codex-wake-${{ matrix.target }}.tar.gz"
+          mkdir staging
+          cp "target/${{ matrix.target }}/release/codex-wake" staging/codex-wake
+          cp README.md LICENSE staging/
+          chmod 0755 staging/codex-wake
+          tar -C staging -czf "$asset" codex-wake README.md LICENSE
+          shasum -a 256 "$asset" >"$asset.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: codex-wake-${{ matrix.target }}
+          path: |
+            codex-wake-${{ matrix.target }}.tar.gz
+            codex-wake-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Build checksum manifest
+        run: |
+          cat dist/*.sha256 | sort --key=2 >dist/SHA256SUMS
+          rm dist/*.sha256
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          dist/*.tar.gz dist/SHA256SUMS
+          --verify-tag
+          --generate-notes
+          --title "$GITHUB_REF_NAME"
