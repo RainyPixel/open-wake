@@ -1,4 +1,4 @@
-use crate::setup::{InstallScope, SetupTarget, inspect_hook, inspect_skill};
+use crate::setup::{InstallScope, SetupTarget, inspect_hook, inspect_hook_enabled, inspect_skill};
 use crate::update::check_for_update_cached;
 use crate::{
     ArmRequest, ConditionStatus, StopHookInput, arm, directory_can_be_created, handle_stop_hook,
@@ -349,8 +349,9 @@ fn inspect_codex(report: &mut DoctorReport) {
                 } else {
                     "Codex does not report the hooks feature enabled".to_owned()
                 },
-                fix: (!hooks_enabled)
-                    .then(|| "upgrade Codex CLI to a release with hooks enabled".to_owned()),
+                fix: (!hooks_enabled).then(|| {
+                    "run `open-wake setup --scope user|project`, then restart Codex".to_owned()
+                }),
             });
         }
         Ok(output) => report.push(DoctorCheck {
@@ -417,6 +418,26 @@ fn inspect_target(target: &SetupTarget, report: &mut DoctorReport) {
             fix: Some(target.setup_command()),
         }),
     }
+    match inspect_hook_enabled(target) {
+        Ok(true) => report.push(DoctorCheck {
+            name: format!("{prefix}_hook_enabled"),
+            status: CheckStatus::Pass,
+            detail: "managed Stop hook is enabled in Codex state".to_owned(),
+            fix: None,
+        }),
+        Ok(false) => report.push(DoctorCheck {
+            name: format!("{prefix}_hook_enabled"),
+            status: CheckStatus::Fail,
+            detail: "managed Stop hook is disabled in Codex state".to_owned(),
+            fix: Some(format!("{}, then restart Codex", target.setup_command())),
+        }),
+        Err(error) => report.push(DoctorCheck {
+            name: format!("{prefix}_hook_enabled"),
+            status: CheckStatus::Fail,
+            detail: error,
+            fix: Some(target.setup_command()),
+        }),
+    }
 
     if target.scope == InstallScope::Project && find_on_path("open-wake").is_none() {
         report.push(DoctorCheck {
@@ -430,9 +451,12 @@ fn inspect_target(target: &SetupTarget, report: &mut DoctorReport) {
     report.push(DoctorCheck {
         name: format!("{prefix}_hook_trust"),
         status: CheckStatus::Warn,
-        detail: "hook trust is interactive Codex state and cannot be verified non-interactively"
+        detail: "hook enablement is verified, but trust still requires interactive Codex review"
             .to_owned(),
-        fix: Some("open `/hooks`, review the command, and trust this hook definition".to_owned()),
+        fix: Some(
+            "open `/hooks`, verify the hook is enabled, review the command, and trust it if requested"
+                .to_owned(),
+        ),
     });
 }
 

@@ -7,6 +7,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 pub const MANAGED_STATUS_MESSAGE: &str = "open-wake: waiting for armed condition";
 const HOOK_DESCRIPTION: &str = "Resume Codex when an armed local condition completes.";
@@ -37,6 +38,7 @@ pub struct SetupTarget {
     pub skill_dir: PathBuf,
     pub hook_command: String,
     pub hook_mode: u32,
+    pub codex_config_path: Option<PathBuf>,
 }
 
 impl SetupTarget {
@@ -47,6 +49,7 @@ impl SetupTarget {
             skill_dir: project_root.join(".agents/skills/open-wake"),
             hook_command: "open-wake hook".to_owned(),
             hook_mode: 0o644,
+            codex_config_path: None,
         }
     }
 
@@ -57,7 +60,13 @@ impl SetupTarget {
             skill_dir: home.join(".agents/skills/open-wake"),
             hook_command: format!("{} hook", shell_quote(binary.as_os_str())),
             hook_mode: 0o600,
+            codex_config_path: Some(codex_home.join("config.toml")),
         }
+    }
+
+    pub fn with_codex_config_path(mut self, path: PathBuf) -> Self {
+        self.codex_config_path = Some(path);
+        self
     }
 
     pub fn setup_command(&self) -> String {
@@ -111,7 +120,12 @@ pub fn managed_hook_config(command: &str) -> Value {
 pub fn setup(target: &SetupTarget, dry_run: bool) -> Result<SetupReport, String> {
     let mut changes = Vec::new();
     let (mut root, existed) = read_hook_root(&target.hook_path)?;
+    let old_state_keys = managed_hook_state_keys(&root, &target.hook_path)?;
     merge_managed_hook(&mut root, &target.hook_command)?;
+    let new_state_keys = managed_hook_state_keys(&root, &target.hook_path)?;
+    let new_state_key = new_state_keys
+        .first()
+        .ok_or_else(|| "managed Stop hook has no Codex state key".to_owned())?;
     let hook_bytes = pretty_json(&root)?;
     changes.push(install_file(
         &target.hook_path,
@@ -120,6 +134,14 @@ pub fn setup(target: &SetupTarget, dry_run: bool) -> Result<SetupReport, String>
         dry_run,
         existed,
     )?);
+    if let Some(config_path) = &target.codex_config_path {
+        changes.push(enable_hook_state(
+            config_path,
+            &old_state_keys,
+            new_state_key,
+            dry_run,
+        )?);
+    }
     changes.push(install_file(
         &target.skill_dir.join("SKILL.md"),
         SKILL_MD.as_bytes(),
@@ -146,6 +168,7 @@ pub fn uninstall(target: &SetupTarget, dry_run: bool) -> Result<SetupReport, Str
 
     if target.hook_path.exists() {
         let (mut root, _) = read_hook_root(&target.hook_path)?;
+        let state_keys = managed_hook_state_keys(&root, &target.hook_path)?;
         let removed = remove_managed_hooks(&mut root)?;
         if removed {
             if is_empty_managed_hook_file(&root) {
@@ -173,6 +196,9 @@ pub fn uninstall(target: &SetupTarget, dry_run: bool) -> Result<SetupReport, Str
                 path: target.hook_path.clone(),
                 action: ChangeKind::Missing,
             });
+        }
+        if removed && let Some(config_path) = &target.codex_config_path {
+            changes.push(remove_hook_state(config_path, &state_keys, dry_run)?);
         }
     } else {
         changes.push(FileChange {
@@ -242,6 +268,46 @@ pub fn inspect_hook(target: &SetupTarget) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+pub fn inspect_hook_enabled(target: &SetupTarget) -> Result<bool, String> {
+    let config_path = target
+        .codex_config_path
+        .as_ref()
+        .ok_or_else(|| "Codex user config path is unavailable".to_owned())?;
+    let (root, _) = read_hook_root(&target.hook_path)?;
+    let state_keys = managed_hook_state_keys(&root, &target.hook_path)?;
+    if state_keys.len() != 1 {
+        return Err(format!(
+            "expected one managed Stop hook state key, found {}",
+            state_keys.len()
+        ));
+    }
+    let (document, existed) = read_codex_config(config_path)?;
+    if !existed {
+        return Ok(true);
+    }
+    let Some(state) = document
+        .get("hooks")
+        .and_then(Item::as_table)
+        .and_then(|hooks| hooks.get("state"))
+        .and_then(Item::as_table)
+    else {
+        return Ok(true);
+    };
+    let Some(entry) = state.get(&state_keys[0]).and_then(Item::as_table) else {
+        return Ok(true);
+    };
+    match entry.get("enabled") {
+        Some(enabled) => enabled.as_bool().ok_or_else(|| {
+            format!(
+                "{} stores a non-boolean enabled state for {}",
+                config_path.display(),
+                state_keys[0]
+            )
+        }),
+        None => Ok(true),
+    }
 }
 
 pub fn inspect_skill(target: &SetupTarget) -> Result<(), String> {
@@ -379,6 +445,144 @@ fn managed_handlers(root: &Value) -> Result<Vec<&Map<String, Value>>, String> {
         }
     }
     Ok(handlers)
+}
+
+fn managed_hook_state_keys(root: &Value, hook_path: &Path) -> Result<Vec<String>, String> {
+    let Some(object) = root.as_object() else {
+        return Err("hooks.json root must be an object".to_owned());
+    };
+    let Some(hooks) = object.get("hooks") else {
+        return Ok(Vec::new());
+    };
+    let hooks = hooks
+        .as_object()
+        .ok_or_else(|| "hooks.json `hooks` must be an object".to_owned())?;
+    let Some(stop) = hooks.get("Stop") else {
+        return Ok(Vec::new());
+    };
+    let stop = stop
+        .as_array()
+        .ok_or_else(|| "hooks.json `hooks.Stop` must be an array".to_owned())?;
+    let mut keys = Vec::new();
+    for (group_index, group) in stop.iter().enumerate() {
+        let Some(group_hooks) = group
+            .as_object()
+            .and_then(|object| object.get("hooks"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for (handler_index, handler) in group_hooks.iter().enumerate() {
+            if is_managed_handler(handler) {
+                keys.push(format!(
+                    "{}:stop:{group_index}:{handler_index}",
+                    hook_path.display()
+                ));
+            }
+        }
+    }
+    Ok(keys)
+}
+
+fn enable_hook_state(
+    path: &Path,
+    old_keys: &[String],
+    new_key: &str,
+    dry_run: bool,
+) -> Result<FileChange, String> {
+    let (mut document, existed) = read_codex_config(path)?;
+    let root = document.as_table_mut();
+    let features = ensure_table(root, "features", path)?;
+    features["hooks"] = value(true);
+    let hooks = ensure_table(root, "hooks", path)?;
+    let state = ensure_table(hooks, "state", path)?;
+    for old_key in old_keys {
+        if old_key != new_key {
+            state.remove(old_key);
+        }
+    }
+    let hook = ensure_table(state, new_key, path)?;
+    hook["enabled"] = value(true);
+    install_file(
+        path,
+        document.to_string().as_bytes(),
+        0o600,
+        dry_run,
+        existed,
+    )
+}
+
+fn remove_hook_state(
+    path: &Path,
+    state_keys: &[String],
+    dry_run: bool,
+) -> Result<FileChange, String> {
+    let (mut document, existed) = read_codex_config(path)?;
+    if !existed {
+        return Ok(FileChange {
+            path: path.to_owned(),
+            action: ChangeKind::Missing,
+        });
+    }
+    let mut removed = false;
+    if let Some(state) = document
+        .get_mut("hooks")
+        .and_then(Item::as_table_mut)
+        .and_then(|hooks| hooks.get_mut("state"))
+        .and_then(Item::as_table_mut)
+    {
+        for key in state_keys {
+            removed |= state.remove(key).is_some();
+        }
+    }
+    if !removed {
+        return Ok(FileChange {
+            path: path.to_owned(),
+            action: ChangeKind::Unchanged,
+        });
+    }
+    install_file(path, document.to_string().as_bytes(), 0o600, dry_run, true)
+}
+
+fn read_codex_config(path: &Path) -> Result<(DocumentMut, bool), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "refusing to replace symlinked Codex config {}",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((DocumentMut::new(), false));
+        }
+        Err(error) => return Err(format!("inspect {}: {error}", path.display())),
+    }
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("read Codex config {}: {error}", path.display()))?;
+    let document = contents
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("parse Codex config {}: {error}", path.display()))?;
+    Ok((document, true))
+}
+
+fn ensure_table<'a>(
+    parent: &'a mut Table,
+    key: &str,
+    path: &Path,
+) -> Result<&'a mut Table, String> {
+    if parent.get(key).is_none() {
+        parent.insert(key, Item::Table(Table::new()));
+    }
+    parent
+        .get_mut(key)
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| {
+            format!(
+                "Codex config {} expects `{key}` to be a table",
+                path.display()
+            )
+        })
 }
 
 fn is_managed_handler(value: &Value) -> bool {

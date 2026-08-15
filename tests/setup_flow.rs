@@ -1,4 +1,6 @@
-use open_wake::setup::{ChangeKind, SetupTarget, inspect_hook, inspect_skill, setup, uninstall};
+use open_wake::setup::{
+    ChangeKind, SetupTarget, inspect_hook, inspect_hook_enabled, inspect_skill, setup, uninstall,
+};
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -6,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use toml_edit::{DocumentMut, value};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -140,9 +143,19 @@ fn user_setup_uses_private_hook_file_and_absolute_binary() {
     let codex_home = root.as_ref().join("codex-home");
     let binary = root.as_ref().join("bin/open-wake");
     let target = SetupTarget::user(&home, &codex_home, &binary);
+    let state_key = format!("{}:stop:0:0", target.hook_path.display());
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(
+        codex_home.join("config.toml"),
+        format!(
+            "# preserve this comment\n[features]\nhooks = false\n\n[hooks.state.\"{state_key}\"]\nenabled = false\ntrusted_hash = \"sha256:keep\"\n\n[hooks.state.\"unrelated:stop:0:0\"]\nenabled = false\n"
+        ),
+    )
+    .unwrap();
 
     setup(&target, false).unwrap();
     inspect_hook(&target).unwrap();
+    assert!(inspect_hook_enabled(&target).unwrap());
     let root: Value = serde_json::from_slice(&fs::read(&target.hook_path).unwrap()).unwrap();
     assert_eq!(
         root["hooks"]["Stop"][0]["hooks"][0]["command"],
@@ -155,6 +168,39 @@ fn user_setup_uses_private_hook_file_and_absolute_binary() {
             .mode()
             & 0o777,
         0o600
+    );
+
+    let config = fs::read_to_string(codex_home.join("config.toml")).unwrap();
+    assert!(config.contains("# preserve this comment"));
+    let document = config.parse::<DocumentMut>().unwrap();
+    assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
+    assert_eq!(
+        document["hooks"]["state"][&state_key]["enabled"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        document["hooks"]["state"][&state_key]["trusted_hash"].as_str(),
+        Some("sha256:keep")
+    );
+    assert_eq!(
+        document["hooks"]["state"]["unrelated:stop:0:0"]["enabled"].as_bool(),
+        Some(false)
+    );
+
+    let mut disabled = document;
+    disabled["hooks"]["state"][&state_key]["enabled"] = value(false);
+    fs::write(codex_home.join("config.toml"), disabled.to_string()).unwrap();
+    assert!(!inspect_hook_enabled(&target).unwrap());
+
+    setup(&target, false).unwrap();
+    assert!(inspect_hook_enabled(&target).unwrap());
+    uninstall(&target, false).unwrap();
+    let config = fs::read_to_string(codex_home.join("config.toml")).unwrap();
+    let document = config.parse::<DocumentMut>().unwrap();
+    assert!(document["hooks"]["state"].get(&state_key).is_none());
+    assert_eq!(
+        document["hooks"]["state"]["unrelated:stop:0:0"]["enabled"].as_bool(),
+        Some(false)
     );
 }
 
@@ -224,6 +270,52 @@ fn cli_setup_doctor_and_uninstall_complete_a_project_lifecycle() {
             .iter()
             .any(|check| { check["name"] == "project_hook_trust" && check["status"] == "warn" })
     );
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| { check["name"] == "project_hook_enabled" && check["status"] == "pass" })
+    );
+
+    let config_path = home.join(".codex/config.toml");
+    let state_key = format!("{}:stop:0:0", project.join(".codex/hooks.json").display());
+    let mut config = fs::read_to_string(&config_path)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    config["hooks"]["state"][&state_key]["enabled"] = value(false);
+    fs::write(&config_path, config.to_string()).unwrap();
+
+    let disabled_doctor = Command::new(&executable)
+        .args(["doctor", "--scope", "project", "--project-dir"])
+        .arg(&project)
+        .arg("--json")
+        .env("HOME", &home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("OPEN_WAKE_NO_UPDATE_CHECK", "1")
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(!disabled_doctor.status.success());
+    let report: Value = serde_json::from_slice(&disabled_doctor.stdout).unwrap();
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| { check["name"] == "project_hook_enabled" && check["status"] == "fail" })
+    );
+
+    let repair = Command::new(&executable)
+        .args(["setup", "--scope", "project", "--project-dir"])
+        .arg(&project)
+        .env("HOME", &home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(repair.status.success());
 
     let uninstall_output = Command::new(&executable)
         .args(["uninstall", "--scope", "project", "--project-dir"])

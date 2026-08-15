@@ -470,7 +470,7 @@ fn run(cli: Cli) -> Result<bool, String> {
             print_setup_report(&report, args.json)?;
             if !args.dry_run && !args.json {
                 println!(
-                    "next: restart Codex if the skill is not visible, then open `/hooks`, review the command, and trust it"
+                    "next: restart Codex, then open `/hooks`, verify the hook is enabled, review the command, and trust it if requested"
                 );
             }
         }
@@ -566,7 +566,13 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
 
 fn resolve_target(scope: ScopeArg, project_dir: Option<&Path>) -> Result<SetupTarget, String> {
     match scope {
-        ScopeArg::Project => Ok(SetupTarget::project(&resolve_project_root(project_dir)?)),
+        ScopeArg::Project => {
+            let target = SetupTarget::project(&resolve_project_root(project_dir)?);
+            Ok(match resolve_codex_config_path() {
+                Some(path) => target.with_codex_config_path(path),
+                None => target,
+            })
+        }
         ScopeArg::User => {
             let home = env::var_os("HOME")
                 .map(PathBuf::from)
@@ -579,6 +585,13 @@ fn resolve_target(scope: ScopeArg, project_dir: Option<&Path>) -> Result<SetupTa
             Ok(SetupTarget::user(&home, &codex_home, &binary))
         }
     }
+}
+
+fn resolve_codex_config_path() -> Option<PathBuf> {
+    env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .map(|codex_home| codex_home.join("config.toml"))
 }
 
 fn resolve_project_root(explicit: Option<&Path>) -> Result<PathBuf, String> {

@@ -36,7 +36,7 @@ copied wholesale into the conversation.
 
 - Linux or macOS
 - Rust 1.88 or newer to build from source
-- Codex CLI with the `hooks` feature enabled
+- Codex CLI with hooks support
 
 ## Install
 
@@ -71,10 +71,10 @@ cargo install --path . --locked
 Choose exactly one setup scope:
 
 ```console
-# Writes .codex/hooks.json and .agents/skills/open-wake in this repository.
+# Writes the project hook/skill and enables that hook in the user Codex config.
 open-wake setup --scope project
 
-# Writes ~/.codex/hooks.json and ~/.agents/skills/open-wake.
+# Writes the user hook/skill and enables that hook in the user Codex config.
 open-wake setup --scope user
 ```
 
@@ -82,13 +82,16 @@ open-wake setup --scope user
 `open-wake hook`, so every contributor using the checked-in hook must have the
 binary on `PATH`. User setup records the current executable's absolute path.
 
-Setup merges its `Stop` entry with existing hooks and is idempotent. It installs
-a standalone Codex skill rather than editing `AGENTS.md`; the skill teaches the
-agent when and how to arm a condition. Use `--dry-run` to preview writes and
-`--json` for a machine-readable report.
+Setup merges its `Stop` entry with existing hooks and is idempotent. It enables
+the hooks feature and the exact installed hook in the user's Codex
+`config.toml`, while preserving other hook state and any existing trust hash.
+It installs a standalone Codex skill rather than editing `AGENTS.md`; the skill
+teaches the agent when and how to arm a condition. Use `--dry-run` to preview
+writes and `--json` for a machine-readable report.
 
-Restart Codex if the skill is not visible. Open `/hooks`, review the exact
-command, and trust the installed definition before relying on it.
+Restart Codex after setup. Open `/hooks`, verify that the hook is enabled,
+review the exact command, and trust the installed definition if Codex requests
+review. Setup never grants trust silently.
 
 ## Updates
 
@@ -129,14 +132,15 @@ verifies:
   child process running;
 - the latest published GitHub release, unless offline checks are disabled;
 - the selected hook command, timeout, and ownership marker;
+- whether the exact managed hook is enabled in Codex state;
 - the installed skill bytes;
 - whether `open-wake` is on `PATH` for project scope.
 
 Doctor never repairs configuration, kills processes, or deletes job records.
 Failed checks exit non-zero and include an exact setup command. A stale job is
 a warning with its ID and log path because heartbeat loss is not proof that the
-child stopped. Hook trust remains a warning because Codex exposes that review
-as interactive `/hooks` state rather than a stable non-interactive readback.
+child stopped. Hook trust remains a warning because setup deliberately leaves
+security review to interactive `/hooks` rather than writing a trusted hash.
 The isolated protocol smoke test proves the handler but cannot prove that the
 current Codex host invoked the configured `Stop` hook. Doctor reports an
 expired active condition with zero attempts as evidence that it did not.

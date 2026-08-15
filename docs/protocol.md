@@ -85,6 +85,7 @@ deadline accounting includes predicate execution and intervals.
 
 ## Trust boundary
 
-Installing configuration does not grant trust silently. Codex users must review
-the discovered hook command in `/hooks`. Project hooks additionally depend on
-the repository's `.codex` configuration being trusted by Codex.
+Setup enables the hooks feature and the exact installed hook state, but it does
+not grant trust silently. Codex users must review the discovered hook command
+in `/hooks` and trust it if requested. Project hooks additionally depend on the
+repository's `.codex` configuration being trusted by Codex.

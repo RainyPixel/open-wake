@@ -75,5 +75,7 @@ session.
 
 If setup is missing or stale, run `open-wake doctor`. Apply the exact
 `open-wake setup --scope user|project` command it recommends, then review and
-trust the installed hook with `/hooks`. Treat stale-job warnings as uncertain:
-inspect the log and process evidence, and never assume the child stopped.
+trust the installed hook with `/hooks`. Setup enables the hook but never grants
+trust silently, so restart Codex after setup and verify both states in `/hooks`.
+Treat stale-job warnings as uncertain: inspect the log and process evidence,
+and never assume the child stopped.
