@@ -279,7 +279,14 @@ fn cli_setup_doctor_and_uninstall_complete_a_project_lifecycle() {
     );
 
     let config_path = home.join(".codex/config.toml");
-    let state_key = format!("{}:stop:0:0", project.join(".codex/hooks.json").display());
+    let state_key = format!(
+        "{}:stop:0:0",
+        project
+            .canonicalize()
+            .unwrap()
+            .join(".codex/hooks.json")
+            .display()
+    );
     let mut config = fs::read_to_string(&config_path)
         .unwrap()
         .parse::<DocumentMut>()
