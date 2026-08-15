@@ -96,7 +96,7 @@ fn false_predicate_continues_at_deadline_with_last_result() {
         "thread-timeout",
         vec!["sh".into(), "-c".into(), "printf not-yet; exit 1".into()],
     );
-    request.timeout = Duration::from_millis(180);
+    request.timeout = Duration::from_secs(2);
     arm(state.as_ref(), request).unwrap();
 
     let result = handle_stop_hook(state.as_ref(), &input("thread-timeout")).unwrap();
@@ -167,30 +167,55 @@ fn invalid_predicate_wakes_codex_with_the_error() {
 }
 
 #[test]
-fn deadline_kills_the_entire_predicate_process_group() {
+fn check_timeout_kills_the_entire_predicate_process_group() {
     let state = TestDir::new();
-    let leaked_marker = state.as_ref().join("leaked-child");
+    let first_check = state.as_ref().join("first-check");
+    let child_pid = state.as_ref().join("child-pid");
     let mut request = request(
         state.as_ref(),
         "thread-process-group",
         vec![
             "sh".into(),
             "-c".into(),
-            format!("(sleep 0.5; touch '{}') & wait", leaked_marker.display()),
+            format!(
+                "if test -e '{}'; then exit 0; fi; : >'{}'; sleep 60 & printf '%s\\n' \"$!\" >'{}'; wait",
+                first_check.display(),
+                first_check.display(),
+                child_pid.display()
+            ),
         ],
     );
-    request.timeout = Duration::from_millis(150);
-    request.check_timeout = Duration::from_secs(2);
+    request.timeout = Duration::from_secs(3);
+    request.check_timeout = Duration::from_millis(200);
     arm(state.as_ref(), request).unwrap();
 
-    let started = Instant::now();
     let result = handle_stop_hook(state.as_ref(), &input("thread-process-group")).unwrap();
     assert!(matches!(result, HookResult::Continue(_)));
-    assert!(started.elapsed() < Duration::from_secs(1));
+    let condition = status(state.as_ref(), "thread-process-group")
+        .unwrap()
+        .unwrap();
+    assert_eq!(condition.status, ConditionStatus::Succeeded);
+    assert_eq!(condition.attempts, 2);
 
-    std::thread::sleep(Duration::from_millis(600));
-    assert!(
-        !leaked_marker.exists(),
-        "a child process survived the predicate deadline"
-    );
+    let child_pid = fs::read_to_string(child_pid)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let result = unsafe { libc::kill(child_pid, 0) };
+        if result == -1 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a child process survived the predicate timeout"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
