@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -37,6 +38,9 @@ pub struct JobReference {
 pub enum ConditionStatus {
     Armed,
     Waiting,
+    // Kept for source and record compatibility. New code never writes this
+    // transitional state; it is terminal and `cancel` normalizes it.
+    #[doc(hidden)]
     CancelRequested,
     Succeeded,
     TimedOut,
@@ -46,7 +50,7 @@ pub enum ConditionStatus {
 
 impl ConditionStatus {
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::Armed | Self::Waiting | Self::CancelRequested)
+        matches!(self, Self::Armed | Self::Waiting)
     }
 }
 
@@ -152,16 +156,19 @@ pub fn current_session_id(explicit: Option<String>) -> Result<String, String> {
 
 pub fn arm(state_dir: &Path, request: ArmRequest) -> Result<Condition, String> {
     validate_request(&request)?;
-    ensure_state_dir(state_dir).map_err(io_error("create state directory"))?;
+    let _lock = lock_condition(state_dir, &request.session_id)?;
     let path = condition_path(state_dir, &request.session_id);
 
-    if let Ok(existing) = read_condition(&path)
-        && existing.status.is_active()
-    {
-        return Err(format!(
-            "condition {} is already active for this Codex session (status: {:?})",
-            existing.id, existing.status
-        ));
+    match read_condition(&path) {
+        Ok(existing) if existing.status.is_active() => {
+            return Err(format!(
+                "condition {} is already active for this Codex session (status: {:?})",
+                existing.id, existing.status
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("read existing condition: {error}")),
     }
 
     let created_at_ms = now_ms();
@@ -201,16 +208,46 @@ pub fn status(state_dir: &Path, session_id: &str) -> Result<Option<Condition>, S
 }
 
 pub fn cancel(state_dir: &Path, session_id: &str) -> Result<Condition, String> {
+    let _lock = lock_condition(state_dir, session_id)?;
     let path = condition_path(state_dir, session_id);
-    let mut condition = read_condition(&path).map_err(io_error("read condition"))?;
+    let condition = read_condition(&path).map_err(io_error("read condition"))?;
+    cancel_condition(&path, condition)
+}
+
+#[doc(hidden)]
+pub fn cancel_if_current(
+    state_dir: &Path,
+    session_id: &str,
+    expected_id: &str,
+) -> Result<Option<Condition>, String> {
+    let _lock = lock_condition(state_dir, session_id)?;
+    let path = condition_path(state_dir, session_id);
+    let condition = read_condition(&path).map_err(io_error("read condition"))?;
+    if condition.id != expected_id {
+        return Ok(None);
+    }
+    cancel_condition(&path, condition).map(Some)
+}
+
+fn cancel_condition(path: &Path, mut condition: Condition) -> Result<Condition, String> {
+    if matches!(
+        condition.status,
+        ConditionStatus::CancelRequested | ConditionStatus::Cancelled
+    ) {
+        if condition.status != ConditionStatus::Cancelled || condition.resolved_at_ms.is_none() {
+            mark_resolved(&mut condition, ConditionStatus::Cancelled);
+            write_condition(path, &condition).map_err(io_error("resolve legacy cancellation"))?;
+        }
+        return Ok(condition);
+    }
     if !condition.status.is_active() {
         return Err(format!(
             "condition {} is not active (status: {:?})",
             condition.id, condition.status
         ));
     }
-    condition.status = ConditionStatus::CancelRequested;
-    write_condition(&path, &condition).map_err(io_error("request cancellation"))?;
+    mark_resolved(&mut condition, ConditionStatus::Cancelled);
+    write_condition(path, &condition).map_err(io_error("cancel condition"))?;
     Ok(condition)
 }
 
@@ -219,51 +256,64 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
         return Ok(HookResult::Noop);
     }
 
-    let path = condition_path(state_dir, &input.session_id);
-    let mut condition = match read_condition(&path) {
-        Ok(condition) if condition.status.is_active() => condition,
-        Ok(_) => return Ok(HookResult::Noop),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HookResult::Noop),
-        Err(error) => return Err(format!("read condition: {error}")),
-    };
-    let condition_id = condition.id.clone();
-
-    if condition.status == ConditionStatus::CancelRequested {
-        resolve(&path, &mut condition, ConditionStatus::Cancelled)?;
-        return Ok(HookResult::Noop);
-    }
-
-    condition.status = ConditionStatus::Waiting;
-    write_condition(&path, &condition).map_err(io_error("mark condition waiting"))?;
-
-    loop {
-        if now_ms().saturating_sub(condition.created_at_ms) >= condition.timeout_ms {
-            if let Some(reference) = &condition.job
-                && let Ok(snapshot) = job::snapshot(&reference.root, &reference.id)
-                && snapshot.is_ready()
-            {
-                condition.attempts += 1;
-                condition.last_exit_code = Some(0);
-                condition.last_output = format!("{}\n", snapshot.summary());
-                resolve(&path, &mut condition, ConditionStatus::Succeeded)?;
-                return Ok(HookResult::Continue(format_continuation(&condition)));
-            }
-            resolve(&path, &mut condition, ConditionStatus::TimedOut)?;
-            return Ok(HookResult::Continue(format_continuation(&condition)));
-        }
-
-        match read_condition(&path) {
-            Ok(current) if current.id != condition_id => return Ok(HookResult::Noop),
-            Ok(current) if current.status == ConditionStatus::CancelRequested => {
-                condition = current;
-                resolve(&path, &mut condition, ConditionStatus::Cancelled)?;
-                return Ok(HookResult::Noop);
-            }
-            Ok(_) => {}
+    let mut condition = {
+        let _lock = lock_condition(state_dir, &input.session_id)?;
+        let path = condition_path(state_dir, &input.session_id);
+        let mut condition = match read_condition(&path) {
+            // A Waiting generation already has a hook owner. Only a later
+            // checkpoint may arm it for another Stop event.
+            Ok(condition) if condition.status == ConditionStatus::Armed => condition,
+            Ok(_) => return Ok(HookResult::Noop),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(HookResult::Noop);
             }
-            Err(error) => return Err(format!("refresh condition: {error}")),
+            Err(error) => return Err(format!("read condition: {error}")),
+        };
+        condition.status = ConditionStatus::Waiting;
+        write_condition(&path, &condition).map_err(io_error("mark condition waiting"))?;
+        condition
+    };
+    let condition_id = condition.id.clone();
+
+    loop {
+        let Some(current) = load_waiting_condition(
+            state_dir,
+            &input.session_id,
+            &condition_id,
+            "refresh condition",
+        )?
+        else {
+            return Ok(HookResult::Noop);
+        };
+        condition = current;
+
+        if now_ms().saturating_sub(condition.created_at_ms) >= condition.timeout_ms {
+            let completed_job = condition
+                .job
+                .as_ref()
+                .and_then(|reference| job::snapshot(&reference.root, &reference.id).ok())
+                .filter(|snapshot| snapshot.is_ready())
+                .map(|snapshot| format!("{}\n", snapshot.summary()));
+            let Some(resolved) = update_waiting_condition(
+                state_dir,
+                &input.session_id,
+                &condition_id,
+                "resolve condition deadline",
+                |current| {
+                    if let Some(summary) = &completed_job {
+                        current.attempts += 1;
+                        current.last_exit_code = Some(0);
+                        current.last_output.clone_from(summary);
+                        mark_resolved(current, ConditionStatus::Succeeded);
+                    } else {
+                        mark_resolved(current, ConditionStatus::TimedOut);
+                    }
+                },
+            )?
+            else {
+                return Ok(HookResult::Noop);
+            };
+            return Ok(HookResult::Continue(format_continuation(&resolved)));
         }
 
         let remaining = Duration::from_millis(
@@ -274,36 +324,59 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
         let check = match run_check(state_dir, &condition, remaining) {
             Ok(check) => check,
             Err(error) => {
-                condition.attempts += 1;
-                condition.last_output = error;
-                resolve(&path, &mut condition, ConditionStatus::Failed)?;
-                return Ok(HookResult::Continue(format_continuation(&condition)));
+                let Some(failed) = update_waiting_condition(
+                    state_dir,
+                    &input.session_id,
+                    &condition_id,
+                    "record condition failure",
+                    |current| {
+                        current.attempts += 1;
+                        current.last_output.clone_from(&error);
+                        mark_resolved(current, ConditionStatus::Failed);
+                    },
+                )?
+                else {
+                    return Ok(HookResult::Noop);
+                };
+                return Ok(HookResult::Continue(format_continuation(&failed)));
             }
         };
-        condition.attempts += 1;
-        condition.last_exit_code = check.exit_code;
-        condition.last_output = check.output;
+        let observed_at_ms = now_ms();
+        let Some(updated) = update_waiting_condition(
+            state_dir,
+            &input.session_id,
+            &condition_id,
+            "record condition check",
+            |current| {
+                current.attempts += 1;
+                current.last_exit_code = check.exit_code;
+                current.last_output.clone_from(&check.output);
+                if check.exit_code == Some(0) && !check.timed_out {
+                    mark_resolved(current, ConditionStatus::Succeeded);
+                } else if current
+                    .next_checkpoint_at_ms
+                    .is_some_and(|checkpoint_at_ms| observed_at_ms >= checkpoint_at_ms)
+                {
+                    current.status = ConditionStatus::Armed;
+                    current.checkpoints += 1;
+                    current.next_checkpoint_at_ms = current
+                        .check_every_ms
+                        .map(|interval| observed_at_ms.saturating_add(interval));
+                }
+            },
+        )?
+        else {
+            return Ok(HookResult::Noop);
+        };
+        condition = updated;
 
-        if check.exit_code == Some(0) && !check.timed_out {
-            resolve(&path, &mut condition, ConditionStatus::Succeeded)?;
+        if condition.status == ConditionStatus::Succeeded {
             return Ok(HookResult::Continue(format_continuation(&condition)));
         }
-
-        let observed_at_ms = now_ms();
-        if condition
-            .next_checkpoint_at_ms
-            .is_some_and(|checkpoint_at_ms| observed_at_ms >= checkpoint_at_ms)
-        {
-            condition.status = ConditionStatus::Armed;
-            condition.checkpoints += 1;
-            condition.next_checkpoint_at_ms = condition
-                .check_every_ms
-                .map(|interval| observed_at_ms.saturating_add(interval));
-            write_condition(&path, &condition).map_err(io_error("record checkpoint"))?;
+        if condition.status == ConditionStatus::Armed {
             return Ok(HookResult::Continue(format_checkpoint(&condition)));
         }
 
-        write_condition(&path, &condition).map_err(io_error("update condition"))?;
         let remaining_ms = condition
             .timeout_ms
             .saturating_sub(now_ms().saturating_sub(condition.created_at_ms));
@@ -375,11 +448,18 @@ fn run_check(
     condition: &Condition,
     remaining: Duration,
 ) -> Result<CheckResult, String> {
-    let output_path = state_dir.join(format!(
-        "{}.last-check.log",
-        safe_name(&condition.session_id)
-    ));
-    let output = open_private_truncate(&output_path).map_err(io_error("open check output"))?;
+    let output_path = condition_check_output_path(state_dir, condition);
+    let result = run_check_with_output(condition, remaining, &output_path);
+    let _ = fs::remove_file(output_path);
+    result
+}
+
+fn run_check_with_output(
+    condition: &Condition,
+    remaining: Duration,
+    output_path: &Path,
+) -> Result<CheckResult, String> {
+    let output = open_private_truncate(output_path).map_err(io_error("open check output"))?;
     let error_output = output.try_clone().map_err(io_error("clone check output"))?;
     let mut child = Command::new(&condition.command[0])
         .args(&condition.command[1..])
@@ -415,16 +495,15 @@ fn run_check(
 
     Ok(CheckResult {
         exit_code,
-        output: read_tail(&output_path, OUTPUT_LIMIT_BYTES)
+        output: read_tail(output_path, OUTPUT_LIMIT_BYTES)
             .map_err(io_error("read check output"))?,
         timed_out,
     })
 }
 
-fn resolve(path: &Path, condition: &mut Condition, status: ConditionStatus) -> Result<(), String> {
+fn mark_resolved(condition: &mut Condition, status: ConditionStatus) {
     condition.status = status;
     condition.resolved_at_ms = Some(now_ms());
-    write_condition(path, condition).map_err(io_error("resolve condition"))
 }
 
 fn format_continuation(condition: &Condition) -> String {
@@ -508,6 +587,87 @@ fn condition_path(state_dir: &Path, session_id: &str) -> PathBuf {
     state_dir.join(format!("{}.json", safe_name(session_id)))
 }
 
+fn condition_lock_path(state_dir: &Path, session_id: &str) -> PathBuf {
+    state_dir.join(format!(".{}.lock", safe_name(session_id)))
+}
+
+fn condition_check_output_path(state_dir: &Path, condition: &Condition) -> PathBuf {
+    state_dir.join(format!(
+        "{}.{}.last-check.log",
+        safe_name(&condition.session_id),
+        safe_name(&condition.id)
+    ))
+}
+
+fn lock_condition(state_dir: &Path, session_id: &str) -> Result<File, String> {
+    ensure_state_dir(state_dir).map_err(io_error("create state directory"))?;
+    let lock_path = condition_lock_path(state_dir, session_id);
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(io_error("open condition lock"))?;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(lock);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(format!("lock condition: {error}"));
+        }
+    }
+}
+
+// Atomic rename keeps individual records readable. The session lock makes the
+// read/validate/write transition linearizable across CLI and hook processes.
+fn read_waiting_condition(
+    path: &Path,
+    expected_id: &str,
+    context: &str,
+) -> Result<Option<Condition>, String> {
+    match read_condition(path) {
+        Ok(condition)
+            if condition.id == expected_id && condition.status == ConditionStatus::Waiting =>
+        {
+            Ok(Some(condition))
+        }
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{context}: {error}")),
+    }
+}
+
+fn load_waiting_condition(
+    state_dir: &Path,
+    session_id: &str,
+    expected_id: &str,
+    context: &'static str,
+) -> Result<Option<Condition>, String> {
+    let _lock = lock_condition(state_dir, session_id)?;
+    let path = condition_path(state_dir, session_id);
+    read_waiting_condition(&path, expected_id, context)
+}
+
+fn update_waiting_condition(
+    state_dir: &Path,
+    session_id: &str,
+    expected_id: &str,
+    context: &'static str,
+    update: impl FnOnce(&mut Condition),
+) -> Result<Option<Condition>, String> {
+    let _lock = lock_condition(state_dir, session_id)?;
+    let path = condition_path(state_dir, session_id);
+    let Some(mut condition) = read_waiting_condition(&path, expected_id, context)? else {
+        return Ok(None);
+    };
+    update(&mut condition);
+    write_condition(&path, &condition).map_err(|error| format!("{context}: {error}"))?;
+    Ok(Some(condition))
+}
+
 fn safe_name(value: &str) -> String {
     let mut name = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -539,10 +699,16 @@ fn write_condition(path: &Path, condition: &Condition) -> io::Result<()> {
         std::process::id()
     ));
     let mut file = open_private_truncate(&temporary)?;
-    serde_json::to_writer_pretty(&mut file, condition).map_err(io::Error::other)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(temporary, path)
+    let result = (|| {
+        serde_json::to_writer_pretty(&mut file, condition).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 fn open_private_truncate(path: &Path) -> io::Result<File> {

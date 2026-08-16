@@ -417,9 +417,13 @@ pub fn log_path(root: &Path, id: &str) -> Result<PathBuf, String> {
 }
 
 pub fn record_spawn_failure(root: &Path, id: &str, error: &str) {
-    if let Ok(directory) = checked_job_dir(root, id) {
-        let _ = record_failure(&directory, error);
-    }
+    let _ = try_record_spawn_failure(root, id, error);
+}
+
+#[doc(hidden)]
+pub fn try_record_spawn_failure(root: &Path, id: &str, error: &str) -> Result<(), String> {
+    let directory = checked_job_dir(root, id)?;
+    record_failure(&directory, error).map_err(io_error("record job spawn failure"))
 }
 
 fn record_failure(directory: &Path, error: &str) -> io::Result<()> {

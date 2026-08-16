@@ -128,6 +128,7 @@ verifies:
 - Codex CLI and its hooks feature;
 - the selected writable condition and supervised-job directories;
 - an isolated `arm → hook handler → continuation` protocol smoke test;
+- current-session condition liveness, including missed Stop-hook evidence;
 - supervised-job heartbeats, including stale supervisors that may have left a
   child process running;
 - the latest published GitHub release, unless offline checks are disabled;
@@ -137,13 +138,19 @@ verifies:
 - whether `open-wake` is on `PATH` for project scope.
 
 Doctor never repairs configuration, kills processes, or deletes job records.
-Failed checks exit non-zero and include an exact setup command. A stale job is
+Failed checks exit non-zero and include an actionable fix. A stale job is
 a warning with its ID and log path because heartbeat loss is not proof that the
 child stopped. Hook trust remains a warning because setup deliberately leaves
 security review to interactive `/hooks` rather than writing a trusted hash.
 The isolated protocol smoke test proves the handler but cannot prove that the
 current Codex host invoked the configured `Stop` hook. Doctor reports an
-expired active condition with zero attempts as evidence that it did not.
+expired active condition with zero attempts as a failure and evidence that it
+did not. The same diagnostic survives an upgrade from a legacy
+`cancel_requested` record until `open-wake cancel` normalizes it. For supervised
+jobs, a terminal or stale job paired with an armed zero-attempt condition is
+reported immediately rather than waiting for the condition deadline. An
+unavailable attached job is a failure because its command outcome cannot be
+inferred safely.
 
 ## Run a local job
 
@@ -157,8 +164,9 @@ open-wake run \
   -- cargo build --release
 ```
 
-`run` returns after the detached supervisor acknowledges startup. It reports an
-error instead of claiming success if that acknowledgement never arrives. The
+`run` returns after the detached supervisor acknowledges startup. If that
+acknowledgement fails after the condition is armed, `run` cancels the condition
+and retains the failed job record instead of leaving the session occupied. The
 launcher's exit does not mean the job finished. The job's stdout and stderr
 share one persistent log. Print its absolute path with:
 
@@ -174,8 +182,11 @@ model context and avoids duplicating standard system tools.
 
 At each `--check-every` checkpoint, the same job and condition remain active.
 Inspect the log, then finish the turn normally to keep waiting. There is no
-`continue` command and the job is never restarted. `open-wake cancel` disables
-future wake-ups but deliberately does not terminate the command.
+`continue` command and the job is never restarted. `open-wake cancel` makes the
+condition terminal immediately, releases the session for another condition,
+and disables future wake-ups. It deliberately does not terminate the command.
+Inspect the attached job before using `run` again so a cancelled job still in
+progress is not duplicated accidentally.
 
 A zero or non-zero command exit is terminal: both wake Codex, and the exact
 exit code or Unix signal is recorded. A condition deadline also wakes Codex but
@@ -209,11 +220,19 @@ open-wake update --check
 open-wake uninstall --scope project
 ```
 
+`status` always reports the condition when its record is readable. If an
+attached job record is missing or corrupt, JSON output includes `job_error`
+instead of hiding the condition behind a command failure.
+
 One condition can be active per Codex session. Ephemeral condition state uses
 `$XDG_RUNTIME_DIR/open-wake` when that location is writable. In a restricted
 agent sandbox it falls back to `/tmp/open-wake-$USER`. Override it with
 `OPEN_WAKE_STATE_DIR` or `--state-dir`; explicit overrides are strict and never
-fall back silently.
+fall back silently. State transitions use a per-session process lock and a
+condition generation ID. Only one hook may drive a generation, and an old
+hook or failed launcher cannot overwrite, cancel, or share predicate output with
+a replacement condition. Legacy `cancel_requested` records are terminal and an
+idempotent `cancel` normalizes them to `cancelled`.
 
 Supervised job records and full logs persist under
 `$XDG_STATE_HOME/open-wake/jobs` or `~/.local/state/open-wake/jobs` when the

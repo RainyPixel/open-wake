@@ -24,6 +24,12 @@ original deadline. When that agent turn stops, the next hook invocation resumes
 checking the same predicate. For `run`, the detached command is never launched
 again.
 
+`cancel` transitions an active condition directly to terminal `cancelled`. It
+does not depend on another Stop event, so the same session can be re-armed even
+when Codex never invoked the hook. Records written by older versions with the
+transitional `cancel_requested` status are treated as terminal and normalized
+to `cancelled` by an idempotent `cancel`.
+
 The continuation is the standard Stop-hook response:
 
 ```json
@@ -41,6 +47,12 @@ creating another continuation.
 
 The condition authority is local durable state, not a terminal pane. Terminal
 multiplexers are outside the protocol.
+
+Every read-validate-write transition is serialized by a per-session lock. Only
+one hook may transition an `armed` condition to `waiting`. Hook updates require
+the condition ID they started with and continued ownership of `waiting`;
+predicate output is generation-scoped, so a stale hook cannot modify a
+condition after cancellation, checkpoint handoff, or replacement.
 
 For `run`, a persistent job directory contains `job.json`, a heartbeat,
 `output.log`, and eventually an atomic `result.json`. The result records the
@@ -70,12 +82,19 @@ deadline accounting includes predicate execution and intervals.
 - A missing or inactive condition is a no-op.
 - Predicate exit statuses other than `0` mean "not ready" and are retried.
 - Failure to start or observe a predicate wakes Codex with `failed` evidence.
+- Failure to acknowledge a `run` supervisor cancels its newly armed condition
+  by generation ID and retains the failed job record for inspection. A stale
+  launcher cannot cancel a replacement condition.
 - Overall timeout wakes Codex with the last bounded predicate result. If a
   supervised job has already reached a recorded terminal state, that result
   takes precedence over a late timeout check.
-- Cancellation releases the Stop hook without waking another agent turn.
+- Cancellation releases the session immediately without waking another agent
+  turn. A predicate already in flight may finish before its hook process exits,
+  but its result cannot overwrite the cancellation or a replacement condition.
 - Cancellation stops notifications, not the supervised command.
-- Replacing the active condition record causes the older hook invocation to
+- Callers must inspect an attached job before launching another supervised
+  command after cancellation.
+- Replacing the inactive condition record causes the older hook invocation to
   stop without acting on the new record.
 - Predicate stdout and stderr share one private file; only the last 4 KiB can be
   copied into the continuation.

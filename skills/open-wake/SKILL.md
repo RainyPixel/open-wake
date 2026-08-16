@@ -46,16 +46,22 @@ through their own durable authority.
 5. On terminal continuation, inspect the recorded exit code, signal, timeout,
    or failure before deciding whether the original task succeeded.
 6. If the user returns manually instead of a hook continuation, run
-   `open-wake status --json`. An active condition past its deadline with
-   `attempts: 0` means the Codex host never invoked the `Stop` hook; do not call
-   that an end-to-end success. Run `open-wake cancel` to prevent a later wake,
-   then use `open-wake doctor` and ask the user to review `/hooks`, trust the
-   exact command, and restart Codex if setup changed.
+   `open-wake status --json`. An active condition with `attempts: 0` after its
+   deadline, or while its attached job is terminal or stale, means the Codex
+   host never invoked the `Stop` hook; do not call that an end-to-end success.
+   Run `open-wake doctor` to preserve the diagnostic evidence, then
+   `open-wake cancel` to release the session immediately. Ask the user to review
+   `/hooks`, trust the exact command, and restart Codex before arming another
+   condition.
 
-`open-wake cancel` stops future wake-ups but does not terminate a supervised
-command. If a checkpoint reveals incorrect work, cancel notifications only if
-appropriate and stop the command through its actual execution authority after
-verifying the target.
+`open-wake cancel` makes the condition terminal immediately and permits a new
+condition in the same Codex session. It stops future wake-ups but does not
+terminate a supervised command. Inspect the attached job before using `run`
+again; `job_error` means its outcome is unknown and requires inspection through
+the recorded job authority. Do not accidentally launch a duplicate while the
+cancelled job is still running. If a checkpoint reveals incorrect work, cancel
+notifications only if appropriate and stop the command through its actual
+execution authority after verifying the target.
 
 ## Predicate contract
 

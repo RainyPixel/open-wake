@@ -134,15 +134,38 @@ fn inspect_condition_at(
         Ok(Some(condition)) if condition.status.is_active() => {
             let elapsed_ms = observed_at_ms.saturating_sub(condition.created_at_ms);
             let expired = elapsed_ms >= condition.timeout_ms;
-            let never_observed = expired && condition.attempts == 0;
+            let job_observation = condition
+                .job
+                .as_ref()
+                .map(|reference| job::snapshot(&reference.root, &reference.id));
+            let job_error = job_observation
+                .as_ref()
+                .and_then(|observation| observation.as_ref().err());
+            let unobserved_ready_job = condition.status == ConditionStatus::Armed
+                && condition.attempts == 0
+                && job_observation.as_ref().is_some_and(|observation| {
+                    observation.as_ref().is_ok_and(|job| job.is_ready())
+                });
+            let never_observed = condition.attempts == 0 && (expired || unobserved_ready_job);
+            let unhealthy = expired || unobserved_ready_job || job_error.is_some();
             report.push(DoctorCheck {
                 name: "active_condition".to_owned(),
-                status: if expired {
-                    CheckStatus::Warn
+                status: if unhealthy {
+                    CheckStatus::Fail
                 } else {
                     CheckStatus::Pass
                 },
-                detail: if never_observed {
+                detail: if let Some(error) = job_error {
+                    format!(
+                        "condition {} has an unavailable attached job: {error}",
+                        condition.id
+                    )
+                } else if unobserved_ready_job {
+                    format!(
+                        "condition {} is still Armed with zero attempts although its attached job is terminal or stale; Codex did not invoke the Stop hook",
+                        condition.id
+                    )
+                } else if never_observed {
                     format!(
                         "condition {} passed its deadline with zero attempts; Codex did not invoke the Stop hook",
                         condition.id
@@ -158,8 +181,49 @@ fn inspect_condition_at(
                         condition.id, condition.status, condition.attempts
                     )
                 },
-                fix: expired.then(|| {
-                    "open `/hooks`, trust the exact command, restart Codex if setup changed, then cancel or re-arm the condition"
+                fix: if job_error.is_some() {
+                    Some(
+                        "inspect the recorded job root, log, and process authority before cancelling; do not launch a replacement while the command outcome is unknown"
+                            .to_owned(),
+                    )
+                } else {
+                    unhealthy.then(|| {
+                        "run `open-wake cancel` to release this session, then open `/hooks`, verify and trust the exact command, and restart Codex before arming another condition"
+                            .to_owned()
+                    })
+                },
+            });
+        }
+        Ok(Some(condition))
+            if condition.status == ConditionStatus::CancelRequested
+                || (condition.status == ConditionStatus::Cancelled
+                    && condition.resolved_at_ms.is_none()) =>
+        {
+            let elapsed_ms = observed_at_ms.saturating_sub(condition.created_at_ms);
+            let missed_hook = elapsed_ms >= condition.timeout_ms && condition.attempts == 0;
+            report.push(DoctorCheck {
+                name: "legacy_cancellation".to_owned(),
+                status: if missed_hook {
+                    CheckStatus::Fail
+                } else {
+                    CheckStatus::Warn
+                },
+                detail: if missed_hook {
+                    format!(
+                        "legacy cancellation {} passed its deadline with zero attempts; Codex did not invoke the Stop hook",
+                        condition.id
+                    )
+                } else {
+                    format!(
+                        "condition {} has a legacy incomplete cancellation record",
+                        condition.id
+                    )
+                },
+                fix: Some(if missed_hook {
+                    "run `open-wake cancel` to normalize this terminal record, then open `/hooks`, verify and trust the exact command, and restart Codex before arming another condition"
+                        .to_owned()
+                } else {
+                    "run `open-wake cancel` to normalize the terminal cancellation record"
                         .to_owned()
                 }),
             });
@@ -548,6 +612,29 @@ impl Drop for DoctorDir {
 mod tests {
     use super::*;
 
+    fn arm_test_condition(
+        workspace: &DoctorDir,
+        session_id: &str,
+        timeout: Duration,
+        job: Option<crate::JobReference>,
+    ) -> crate::Condition {
+        arm(
+            workspace.as_ref(),
+            ArmRequest {
+                session_id: session_id.to_owned(),
+                label: Some("acceptance".to_owned()),
+                cwd: workspace.as_ref().to_owned(),
+                command: vec!["true".to_owned()],
+                timeout,
+                interval: Duration::from_millis(50),
+                check_timeout: Duration::from_millis(50),
+                check_every: None,
+                job,
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn stale_jobs_are_warnings_and_are_not_removed() {
         let workspace = DoctorDir::new().unwrap();
@@ -583,21 +670,7 @@ mod tests {
     #[test]
     fn expired_condition_without_attempts_reports_missing_hook_invocation() {
         let workspace = DoctorDir::new().unwrap();
-        let condition = arm(
-            workspace.as_ref(),
-            ArmRequest {
-                session_id: "thread".to_owned(),
-                label: Some("acceptance".to_owned()),
-                cwd: workspace.as_ref().to_owned(),
-                command: vec!["true".to_owned()],
-                timeout: Duration::from_secs(1),
-                interval: Duration::from_millis(50),
-                check_timeout: Duration::from_millis(50),
-                check_every: None,
-                job: None,
-            },
-        )
-        .unwrap();
+        let condition = arm_test_condition(&workspace, "thread", Duration::from_secs(1), None);
 
         let mut report = DoctorReport::new();
         inspect_condition_at(
@@ -612,9 +685,121 @@ mod tests {
             .iter()
             .find(|check| check.name == "active_condition")
             .unwrap();
-        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.status, CheckStatus::Fail);
         assert!(check.detail.contains("zero attempts"));
         assert!(check.detail.contains("did not invoke the Stop hook"));
-        assert!(report.ok);
+        assert!(check.fix.as_deref().unwrap().contains("open-wake cancel"));
+        assert!(check.fix.as_deref().unwrap().contains("/hooks"));
+        assert!(!report.ok);
+    }
+
+    #[test]
+    fn terminal_job_without_attempts_reports_missing_hook_before_deadline() {
+        let workspace = DoctorDir::new().unwrap();
+        let job_root = workspace.as_ref().join("jobs");
+        let spec = job::prepare(
+            &job_root,
+            "thread".to_owned(),
+            Some("terminal build".to_owned()),
+            workspace.as_ref().to_owned(),
+            vec!["true".to_owned()],
+        )
+        .unwrap();
+        let reference = job::reference(&job_root, &spec).unwrap();
+        job::try_record_spawn_failure(&job_root, &spec.id, "recorded terminal result").unwrap();
+        let condition = arm_test_condition(
+            &workspace,
+            "thread",
+            Duration::from_secs(60),
+            Some(reference),
+        );
+
+        let mut report = DoctorReport::new();
+        inspect_condition_at(
+            workspace.as_ref(),
+            "thread",
+            condition.created_at_ms + 1,
+            &mut report,
+        );
+
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "active_condition")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.detail.contains("terminal or stale"));
+        assert!(check.detail.contains("did not invoke the Stop hook"));
+        assert!(!report.ok);
+    }
+
+    #[test]
+    fn unavailable_attached_job_is_an_actionable_failure() {
+        let workspace = DoctorDir::new().unwrap();
+        let job_root = workspace.as_ref().join("jobs");
+        let spec = job::prepare(
+            &job_root,
+            "thread".to_owned(),
+            Some("missing build".to_owned()),
+            workspace.as_ref().to_owned(),
+            vec!["true".to_owned()],
+        )
+        .unwrap();
+        let reference = job::reference(&job_root, &spec).unwrap();
+        let condition = arm_test_condition(
+            &workspace,
+            "thread",
+            Duration::from_secs(60),
+            Some(reference),
+        );
+        fs::remove_dir_all(job_root.join(spec.id)).unwrap();
+
+        let mut report = DoctorReport::new();
+        inspect_condition_at(
+            workspace.as_ref(),
+            "thread",
+            condition.created_at_ms + 1,
+            &mut report,
+        );
+
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "active_condition")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.detail.contains("unavailable attached job"));
+        assert!(check.fix.as_deref().unwrap().contains("outcome is unknown"));
+        assert!(!report.ok);
+    }
+
+    #[test]
+    fn expired_legacy_cancellation_preserves_the_missing_hook_diagnostic() {
+        let workspace = DoctorDir::new().unwrap();
+        let condition =
+            arm_test_condition(&workspace, "legacy-thread", Duration::from_secs(1), None);
+        let path = workspace.as_ref().join("legacy-thread.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["status"] = "cancel_requested".into();
+        fs::write(path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let mut report = DoctorReport::new();
+        inspect_condition_at(
+            workspace.as_ref(),
+            "legacy-thread",
+            condition.created_at_ms + condition.timeout_ms,
+            &mut report,
+        );
+
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "legacy_cancellation")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.detail.contains("zero attempts"));
+        assert!(check.fix.as_deref().unwrap().contains("open-wake cancel"));
+        assert!(!report.ok);
     }
 }

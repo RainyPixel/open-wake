@@ -13,9 +13,9 @@ research.
   persistent combined logs, and a path-only `logs` command.
 - Optional recurring checkpoints that keep the same condition and job active.
 - Success, timeout, failure, replacement, and cancellation outcomes.
-- Per-project or per-user setup, read-only doctor checks including stale job
-  heartbeats and writable state roots, sandbox-aware `/tmp` and `/var/tmp`
-  fallbacks, and safe uninstall.
+- Per-project or per-user setup, read-only doctor checks including missed or
+  expired conditions, stale job heartbeats, and writable state roots,
+  sandbox-aware `/tmp` and `/var/tmp` fallbacks, and safe uninstall.
 - Release Please release PRs, Conventional Commit enforcement, checksummed
   native archives, one-shot installation, self-update, and 24-hour cached
   update notices from `doctor`.
@@ -55,8 +55,9 @@ instead of guessed abstractions.
   guesses after a stale heartbeat.
 - Add explicit job retention and garbage collection with age/size previews;
   never silently delete logs. Consider optional log rotation or a disk budget.
-- Detect stale condition records as well as stale supervised jobs after crashes
-  or host restarts.
+- Detect abandoned `waiting` conditions before their deadline after a hook
+  crash or host restart. Expired, legacy-cancelled, and zero-attempt conditions
+  attached to terminal or stale jobs are already covered.
 - Add a machine-readable event schema for arm, check, wake, timeout, and cancel
   outcomes while keeping model-visible output bounded.
 - Add adaptive checkpoints based on log/activity changes after fixed periodic

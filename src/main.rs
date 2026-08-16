@@ -4,8 +4,8 @@ use open_wake::job::{self, JobSnapshot};
 use open_wake::setup::{ChangeKind, InstallScope, SetupReport, SetupTarget, setup, uninstall};
 use open_wake::update::{UpdateReport, check_for_update, install_release};
 use open_wake::{
-    ArmRequest, Condition, StopHookInput, arm, cancel, current_session_id, default_state_dir,
-    handle_stop_hook, hook_config, hook_output, status,
+    ArmRequest, Condition, StopHookInput, arm, cancel, cancel_if_current, current_session_id,
+    default_state_dir, handle_stop_hook, hook_config, hook_output, status,
 };
 use serde::Serialize;
 use std::env;
@@ -34,7 +34,7 @@ enum Commands {
     Status(SessionArgs),
     /// Print the absolute combined stdout/stderr log path for a supervised job.
     Logs(LogsArgs),
-    /// Request cancellation of the active condition.
+    /// Cancel the condition immediately without stopping an attached job.
     Cancel(SessionArgs),
     /// Install or update the Stop hook and Codex skill.
     Setup(InstallArgs),
@@ -266,6 +266,8 @@ struct StatusReport {
     condition: Condition,
     #[serde(skip_serializing_if = "Option::is_none")]
     job_status: Option<JobSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_error: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -329,8 +331,28 @@ fn run(cli: Cli) -> Result<bool, String> {
             {
                 Ok(pid) => pid,
                 Err(error) => {
-                    job::record_spawn_failure(&job_reference.root, &spec.id, &error);
-                    return Err(error);
+                    let mut recovery = Vec::new();
+                    match cancel_if_current(&state_dir, &condition.session_id, &condition.id) {
+                        Ok(Some(_)) => {
+                            recovery.push(format!("cancelled condition {}", condition.id))
+                        }
+                        Ok(None) => recovery.push(format!(
+                            "left replacement condition unchanged after condition {}",
+                            condition.id
+                        )),
+                        Err(cancel_error) => recovery.push(format!(
+                            "failed to cancel condition {}: {cancel_error}",
+                            condition.id
+                        )),
+                    }
+                    match job::try_record_spawn_failure(&job_reference.root, &spec.id, &error) {
+                        Ok(()) => recovery.push(format!("retained failed job record {}", spec.id)),
+                        Err(record_error) => recovery.push(format!(
+                            "failed to retain job record {}: {record_error}",
+                            spec.id
+                        )),
+                    }
+                    return Err(format!("{error}; {}", recovery.join("; ")));
                 }
             };
             let report = RunReport {
@@ -405,17 +427,20 @@ fn run(cli: Cli) -> Result<bool, String> {
                 println!("no condition for Codex session {session_id}");
                 return Ok(true);
             };
-            let job_snapshot = condition
-                .job
-                .as_ref()
-                .map(|reference| job::snapshot(&reference.root, &reference.id))
-                .transpose()?;
+            let (job_snapshot, job_error) = match condition.job.as_ref() {
+                Some(reference) => match job::snapshot(&reference.root, &reference.id) {
+                    Ok(snapshot) => (Some(snapshot), None),
+                    Err(error) => (None, Some(error)),
+                },
+                None => (None, None),
+            };
             if args.json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&StatusReport {
                         condition,
                         job_status: job_snapshot,
+                        job_error,
                     })
                     .map_err(|error| format!("serialize status: {error}"))?
                 );
@@ -429,6 +454,9 @@ fn run(cli: Cli) -> Result<bool, String> {
                 );
                 if let Some(job) = job_snapshot {
                     println!("{}", job.summary());
+                }
+                if let Some(error) = job_error {
+                    println!("job status unavailable: {error}");
                 }
             }
         }
@@ -461,7 +489,10 @@ fn run(cli: Cli) -> Result<bool, String> {
                         .map_err(|error| format!("serialize condition: {error}"))?
                 );
             } else {
-                println!("cancellation requested for condition {}", condition.id);
+                println!(
+                    "cancelled condition {}; any supervised job remains unchanged",
+                    condition.id
+                );
             }
         }
         Commands::Setup(args) => {
