@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/RainyPixel/open-wake/compare/v0.2.3...v0.2.4) (2026-08-16)
+
+
+### Bug Fixes
+
+* **lifecycle:** make cancellation terminal ([179cc43](https://github.com/RainyPixel/open-wake/commit/179cc43dcda9674a2e0f97a8deb38b0c79fbce72))
+
 ## [0.2.3](https://github.com/RainyPixel/open-wake/compare/v0.2.2...v0.2.3) (2026-08-15)
 
 
