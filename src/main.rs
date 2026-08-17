@@ -5,7 +5,7 @@ use open_wake::setup::{ChangeKind, InstallScope, SetupReport, SetupTarget, setup
 use open_wake::update::{UpdateReport, check_for_update, install_release};
 use open_wake::{
     ArmRequest, Condition, StopHookInput, arm, cancel, cancel_if_current, current_session_id,
-    default_state_dir, handle_stop_hook, hook_config, hook_output, status,
+    default_state_dir, handle_stop_hook, hook_config, hook_output, inspect_condition, status,
 };
 use serde::Serialize;
 use std::env;
@@ -137,9 +137,15 @@ struct ArmArgs {
     #[arg(long, default_value = "1h", value_parser = parse_duration)]
     timeout: Duration,
 
-    /// Delay between predicate invocations.
+    /// Delay between local predicate invocations. This does not wake Codex.
     #[arg(long, default_value = "5s", value_parser = parse_duration)]
-    interval: Duration,
+    poll_every: Duration,
+
+    /// Wake Codex with a progress checkpoint at this interval.
+    ///
+    /// This creates a model turn; the minimum is 1m.
+    #[arg(long, value_parser = parse_duration)]
+    checkpoint_every: Option<Duration>,
 
     /// Maximum duration of one predicate invocation.
     #[arg(long, default_value = "30s", value_parser = parse_duration)]
@@ -168,13 +174,11 @@ struct RunArgs {
     #[arg(long, default_value = "1h", value_parser = parse_duration)]
     timeout: Duration,
 
-    /// Also wake periodically without restarting the command.
+    /// Wake Codex with a progress checkpoint at this interval.
+    ///
+    /// This creates a model turn; the minimum is 1m.
     #[arg(long, value_parser = parse_duration)]
-    check_every: Option<Duration>,
-
-    /// Delay between lightweight job-state checks.
-    #[arg(long, default_value = "5s", value_parser = parse_duration)]
-    interval: Duration,
+    checkpoint_every: Option<Duration>,
 
     /// Override CODEX_THREAD_ID.
     #[arg(long)]
@@ -257,13 +261,14 @@ struct RunReport {
     log_path: PathBuf,
     timeout_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    check_every_ms: Option<u64>,
+    checkpoint_every_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
 struct StatusReport {
     #[serde(flatten)]
     condition: Condition,
+    watcher: open_wake::WatcherStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     job_status: Option<JobSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -284,6 +289,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<bool, String> {
     match cli.command {
         Commands::Run(args) => {
+            warn_frequent_checkpoint(args.checkpoint_every);
             let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
             let job_root = args.job_dir.unwrap_or_else(job::default_job_root);
             let session_id = current_session_id(args.thread)?;
@@ -315,9 +321,9 @@ fn run(cli: Cli) -> Result<bool, String> {
                     cwd,
                     command: predicate,
                     timeout: args.timeout,
-                    interval: args.interval,
+                    poll_every: Duration::from_secs(1),
                     check_timeout: Duration::from_secs(5),
-                    check_every: args.check_every,
+                    checkpoint_every: args.checkpoint_every,
                     job: Some(job_reference.clone()),
                 },
             ) {
@@ -361,8 +367,8 @@ fn run(cli: Cli) -> Result<bool, String> {
                 supervisor_pid,
                 log_path: spec.log_path,
                 timeout_ms: args.timeout.as_millis().try_into().unwrap_or(u64::MAX),
-                check_every_ms: args
-                    .check_every
+                checkpoint_every_ms: args
+                    .checkpoint_every
                     .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX)),
             };
             if args.json {
@@ -373,14 +379,16 @@ fn run(cli: Cli) -> Result<bool, String> {
                 );
             } else {
                 println!(
-                    "started job {} (supervisor {}); log: {}; finish the Codex turn to wait",
+                    "started job {} (supervisor {}); log: {}; {}; finish the Codex turn to wait",
                     report.job_id,
                     report.supervisor_pid,
-                    report.log_path.display()
+                    report.log_path.display(),
+                    checkpoint_note(args.checkpoint_every)
                 );
             }
         }
         Commands::Arm(args) => {
+            warn_frequent_checkpoint(args.checkpoint_every);
             let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
             let session_id = current_session_id(args.thread)?;
             let condition = arm(
@@ -392,17 +400,18 @@ fn run(cli: Cli) -> Result<bool, String> {
                         .map_err(|error| format!("read current directory: {error}"))?,
                     command: args.predicate,
                     timeout: args.timeout,
-                    interval: args.interval,
+                    poll_every: args.poll_every,
                     check_timeout: args.check_timeout,
-                    check_every: None,
+                    checkpoint_every: args.checkpoint_every,
                     job: None,
                 },
             )?;
             println!(
-                "armed condition {} ({}) for {}; finish the Codex turn to wait",
+                "armed condition {} ({}) for {}; {}; finish the Codex turn to wait",
                 condition.id,
                 condition.label.as_deref().unwrap_or("unnamed"),
-                humantime::format_duration(args.timeout)
+                humantime::format_duration(args.timeout),
+                checkpoint_note(args.checkpoint_every)
             );
         }
         Commands::Hook(args) => {
@@ -423,10 +432,11 @@ fn run(cli: Cli) -> Result<bool, String> {
         Commands::Status(args) => {
             let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
             let session_id = current_session_id(args.thread)?;
-            let Some(condition) = status(&state_dir, &session_id)? else {
+            let Some(snapshot) = inspect_condition(&state_dir, &session_id)? else {
                 println!("no condition for Codex session {session_id}");
                 return Ok(true);
             };
+            let condition = snapshot.condition;
             let (job_snapshot, job_error) = match condition.job.as_ref() {
                 Some(reference) => match job::snapshot(&reference.root, &reference.id) {
                     Ok(snapshot) => (Some(snapshot), None),
@@ -439,6 +449,7 @@ fn run(cli: Cli) -> Result<bool, String> {
                     "{}",
                     serde_json::to_string_pretty(&StatusReport {
                         condition,
+                        watcher: snapshot.watcher,
                         job_status: job_snapshot,
                         job_error,
                     })
@@ -446,12 +457,16 @@ fn run(cli: Cli) -> Result<bool, String> {
                 );
             } else {
                 println!(
-                    "{}: {:?}, attempts: {}, last exit: {:?}",
+                    "{}: {:?}, watcher: {:?}, attempts: {}, last exit: {:?}",
                     condition.label.as_deref().unwrap_or(&condition.id),
                     condition.status,
+                    snapshot.watcher.state,
                     condition.attempts,
                     condition.last_exit_code
                 );
+                if let Some(error) = snapshot.watcher.lease_error.as_ref() {
+                    println!("watcher lease: {error}");
+                }
                 if let Some(job) = job_snapshot {
                     println!("{}", job.summary());
                 }
@@ -593,6 +608,26 @@ fn run(cli: Cli) -> Result<bool, String> {
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
     humantime::parse_duration(value).map_err(|error| error.to_string())
+}
+
+fn warn_frequent_checkpoint(checkpoint_every: Option<Duration>) {
+    if checkpoint_every.is_some_and(|interval| interval < Duration::from_secs(5 * 60)) {
+        eprintln!(
+            "open-wake: warning: --checkpoint-every creates a model turn every interval; prefer 5m or longer"
+        );
+    }
+}
+
+fn checkpoint_note(checkpoint_every: Option<Duration>) -> String {
+    checkpoint_every.map_or_else(
+        || "terminal-only wakeups".to_owned(),
+        |interval| {
+            format!(
+                "checkpoint every {} creates model turns",
+                humantime::format_duration(interval)
+            )
+        },
+    )
 }
 
 fn resolve_target(scope: ScopeArg, project_dir: Option<&Path>) -> Result<SetupTarget, String> {

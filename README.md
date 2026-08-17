@@ -128,7 +128,8 @@ verifies:
 - Codex CLI and its hooks feature;
 - the selected writable condition and supervised-job directories;
 - an isolated `arm → hook handler → continuation` protocol smoke test;
-- current-session condition liveness, including missed Stop-hook evidence;
+- current-session condition and hook-lease liveness, including missed
+  Stop-hook evidence and interrupted waiters;
 - supervised-job heartbeats, including stale supervisors that may have left a
   child process running;
 - the latest published GitHub release, unless offline checks are disabled;
@@ -150,7 +151,24 @@ did not. The same diagnostic survives an upgrade from a legacy
 jobs, a terminal or stale job paired with an armed zero-attempt condition is
 reported immediately rather than waiting for the condition deadline. An
 unavailable attached job is a failure because its command outcome cannot be
-inferred safely.
+inferred safely. A `waiting` condition with a stale hook lease is also a
+failure: finish the current turn so the next Stop invocation can recover the
+same condition, or cancel only when abandoning its notifications.
+
+## Polling and checkpoints
+
+The public API deliberately separates two different intervals:
+
+- `arm --poll-every` invokes a local read-only predicate. It never creates a
+  model request.
+- `run` and `arm --checkpoint-every` create a model-visible progress turn.
+  Omit it when only terminal completion or timeout matters.
+
+Checkpoints must be at least one minute and shorter than the overall timeout;
+values below five minutes produce a warning because they can reintroduce
+model-side polling. The former `--interval` and `--check-every` names are not
+accepted as aliases. `run` has no public local polling interval: supervisor
+result detection is an implementation detail.
 
 ## Run a local job
 
@@ -160,7 +178,7 @@ For a small local Unix build, test, or script, use `run`:
 open-wake run \
   --label "release build" \
   --timeout 1h \
-  --check-every 15m \
+  --checkpoint-every 15m \
   -- cargo build --release
 ```
 
@@ -180,8 +198,8 @@ the returned file, for example `tail -n 200 "$(open-wake logs)"` or
 `rg 'error|warning' "$(open-wake logs)"`. This keeps large output outside the
 model context and avoids duplicating standard system tools.
 
-At each `--check-every` checkpoint, the same job and condition remain active.
-Inspect the log, then finish the turn normally to keep waiting. There is no
+At each `--checkpoint-every` checkpoint, the same job and condition remain
+active. Inspect the log, then finish the turn normally to keep waiting. There is no
 `continue` command and the job is never restarted. `open-wake cancel` makes the
 condition terminal immediately, releases the session for another condition,
 and disables future wake-ups. It deliberately does not terminate the command.
@@ -201,8 +219,9 @@ other exit status means not ready yet.
 open-wake arm \
   --label "release build" \
   --timeout 1h \
-  --interval 10s \
+  --poll-every 10s \
   --check-timeout 5s \
+  --checkpoint-every 15m \
   -- sh -c 'test -f target/release/my-app'
 ```
 
@@ -220,19 +239,21 @@ open-wake update --check
 open-wake uninstall --scope project
 ```
 
-`status` always reports the condition when its record is readable. If an
-attached job record is missing or corrupt, JSON output includes `job_error`
-instead of hiding the condition behind a command failure.
+`status` always reports the condition and watcher-lease health when its record
+is readable. If an attached job record is missing or corrupt, JSON output
+includes `job_error` instead of hiding the condition behind a command failure.
 
 One condition can be active per Codex session. Ephemeral condition state uses
 `$XDG_RUNTIME_DIR/open-wake` when that location is writable. In a restricted
 agent sandbox it falls back to `/tmp/open-wake-$USER`. Override it with
 `OPEN_WAKE_STATE_DIR` or `--state-dir`; explicit overrides are strict and never
-fall back silently. State transitions use a per-session process lock and a
-condition generation ID. Only one hook may drive a generation, and an old
-hook or failed launcher cannot overwrite, cancel, or share predicate output with
-a replacement condition. Legacy `cancel_requested` records are terminal and an
-idempotent `cancel` normalizes them to `cancelled`.
+fall back silently. State transitions use a per-session process lock, a
+condition generation ID, and a hook-owner lease with a heartbeat. Only one
+fresh hook lease may drive a generation; if Codex interrupts that hook, the
+next Stop invocation can recover the same `waiting` condition after its lease
+becomes stale. An old hook or failed launcher cannot overwrite, cancel, or
+share predicate output with a replacement condition. Legacy `cancel_requested`
+records are terminal and an idempotent `cancel` normalizes them to `cancelled`.
 
 Supervised job records and full logs persist under
 `$XDG_STATE_HOME/open-wake/jobs` or `~/.local/state/open-wake/jobs` when the

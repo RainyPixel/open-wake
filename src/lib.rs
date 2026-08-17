@@ -3,27 +3,32 @@ use serde_json::{Value, json};
 use std::env;
 use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod doctor;
 pub mod job;
 pub mod setup;
+pub(crate) mod state;
 pub mod update;
 
 pub const HOOK_TIMEOUT_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const MAX_CONDITION_TIMEOUT: Duration = Duration::from_secs(HOOK_TIMEOUT_SECONDS - 60);
 const OUTPUT_LIMIT_BYTES: usize = 4 * 1024;
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const MIN_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(100);
+const MIN_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
+const HOOK_LEASE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const HOOK_LEASE_STALE_AFTER: Duration = Duration::from_secs(5);
+const LEGACY_HOOK_GRACE_MARGIN: Duration = Duration::from_secs(5);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,10 +69,15 @@ pub struct Condition {
     pub command: Vec<String>,
     pub created_at_ms: u64,
     pub timeout_ms: u64,
-    pub interval_ms: u64,
+    #[serde(default, alias = "interval_ms")]
+    pub poll_every_ms: u64,
     pub check_timeout_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub check_every_ms: Option<u64>,
+    #[serde(
+        default,
+        alias = "check_every_ms",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub checkpoint_every_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_checkpoint_at_ms: Option<u64>,
     #[serde(default)]
@@ -88,10 +98,51 @@ pub struct ArmRequest {
     pub cwd: PathBuf,
     pub command: Vec<String>,
     pub timeout: Duration,
-    pub interval: Duration,
+    pub poll_every: Duration,
     pub check_timeout: Duration,
-    pub check_every: Option<Duration>,
+    pub checkpoint_every: Option<Duration>,
     pub job: Option<JobReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HookLease {
+    version: u8,
+    condition_id: String,
+    owner_id: String,
+    pid: u32,
+    heartbeat_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatcherState {
+    Alive,
+    Stale,
+    LegacyUnknown,
+    Armed,
+    Inactive,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WatcherStatus {
+    pub state: WatcherState,
+    pub condition_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ConditionSnapshot {
+    pub condition: Condition,
+    pub watcher: WatcherStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,9 +223,9 @@ pub fn arm(state_dir: &Path, request: ArmRequest) -> Result<Condition, String> {
     }
 
     let created_at_ms = now_ms();
-    let check_every_ms = request.check_every.map(duration_ms);
+    let checkpoint_every_ms = request.checkpoint_every.map(duration_ms);
     let condition = Condition {
-        version: 1,
+        version: 2,
         id: new_condition_id(),
         session_id: request.session_id,
         label: request.label,
@@ -182,10 +233,10 @@ pub fn arm(state_dir: &Path, request: ArmRequest) -> Result<Condition, String> {
         command: request.command,
         created_at_ms,
         timeout_ms: duration_ms(request.timeout),
-        interval_ms: duration_ms(request.interval),
+        poll_every_ms: duration_ms(request.poll_every),
         check_timeout_ms: duration_ms(request.check_timeout),
-        check_every_ms,
-        next_checkpoint_at_ms: check_every_ms.map(|interval| created_at_ms + interval),
+        checkpoint_every_ms,
+        next_checkpoint_at_ms: checkpoint_every_ms.map(|interval| created_at_ms + interval),
         checkpoints: 0,
         job: request.job,
         status: ConditionStatus::Armed,
@@ -195,6 +246,10 @@ pub fn arm(state_dir: &Path, request: ArmRequest) -> Result<Condition, String> {
         resolved_at_ms: None,
     };
     write_condition(&path, &condition).map_err(io_error("write condition"))?;
+    let _ = fs::remove_file(hook_lease_path(
+        path.parent().unwrap_or(Path::new(".")),
+        &condition.session_id,
+    ));
     Ok(condition)
 }
 
@@ -202,6 +257,25 @@ pub fn status(state_dir: &Path, session_id: &str) -> Result<Option<Condition>, S
     let path = condition_path(state_dir, session_id);
     match read_condition(&path) {
         Ok(condition) => Ok(Some(condition)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("read condition: {error}")),
+    }
+}
+
+pub fn inspect_condition(
+    state_dir: &Path,
+    session_id: &str,
+) -> Result<Option<ConditionSnapshot>, String> {
+    let path = condition_path(state_dir, session_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let _lock = lock_condition(state_dir, session_id)?;
+    match read_condition(&path) {
+        Ok(condition) => Ok(Some(ConditionSnapshot {
+            watcher: watcher_status(&path, &condition, now_ms()),
+            condition,
+        })),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("read condition: {error}")),
     }
@@ -242,12 +316,16 @@ fn cancel_condition(path: &Path, mut condition: Condition) -> Result<Condition, 
     }
     if !condition.status.is_active() {
         return Err(format!(
-            "condition {} is not active (status: {:?})",
+            "condition {} is already terminal (status: {:?}); inspect its recorded outcome before arming another condition and do not use cancel as a launch prefix",
             condition.id, condition.status
         ));
     }
     mark_resolved(&mut condition, ConditionStatus::Cancelled);
     write_condition(path, &condition).map_err(io_error("cancel condition"))?;
+    let _ = fs::remove_file(hook_lease_path(
+        path.parent().unwrap_or(Path::new(".")),
+        &condition.session_id,
+    ));
     Ok(condition)
 }
 
@@ -256,23 +334,57 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
         return Ok(HookResult::Noop);
     }
 
-    let mut condition = {
+    let (mut condition, owner_id) = {
         let _lock = lock_condition(state_dir, &input.session_id)?;
         let path = condition_path(state_dir, &input.session_id);
         let mut condition = match read_condition(&path) {
-            // A Waiting generation already has a hook owner. Only a later
-            // checkpoint may arm it for another Stop event.
-            Ok(condition) if condition.status == ConditionStatus::Armed => condition,
+            Ok(condition)
+                if condition.status == ConditionStatus::Armed
+                    || condition.status == ConditionStatus::Waiting =>
+            {
+                condition
+            }
             Ok(_) => return Ok(HookResult::Noop),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(HookResult::Noop);
             }
             Err(error) => return Err(format!("read condition: {error}")),
         };
+        if condition.status == ConditionStatus::Waiting
+            && watcher_status(&path, &condition, now_ms()).state != WatcherState::Stale
+        {
+            // A fresh lease already has an owner, and a legacy v1 record may
+            // still be owned by a hook from the previous binary version.
+            return Ok(HookResult::Noop);
+        }
+        let owner_id = new_condition_id();
+        migrate_condition_to_v2(&mut condition);
         condition.status = ConditionStatus::Waiting;
         write_condition(&path, &condition).map_err(io_error("mark condition waiting"))?;
-        condition
+        if let Ok(old_lease) = read_hook_lease(&hook_lease_path(state_dir, &input.session_id)) {
+            let _ = fs::remove_file(condition_check_output_path(
+                state_dir,
+                &condition,
+                &old_lease.owner_id,
+            ));
+        }
+        let lease = HookLease {
+            version: 1,
+            condition_id: condition.id.clone(),
+            owner_id: owner_id.clone(),
+            pid: std::process::id(),
+            heartbeat_at_ms: now_ms(),
+        };
+        write_hook_lease(&hook_lease_path(state_dir, &input.session_id), &lease)
+            .map_err(io_error("acquire hook lease"))?;
+        (condition, owner_id)
     };
+    let _heartbeat_guard = spawn_hook_heartbeat(
+        state_dir.to_owned(),
+        input.session_id.clone(),
+        condition.id.clone(),
+        owner_id.clone(),
+    );
     let condition_id = condition.id.clone();
 
     loop {
@@ -280,6 +392,7 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
             state_dir,
             &input.session_id,
             &condition_id,
+            &owner_id,
             "refresh condition",
         )?
         else {
@@ -298,6 +411,7 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
                 state_dir,
                 &input.session_id,
                 &condition_id,
+                &owner_id,
                 "resolve condition deadline",
                 |current| {
                     if let Some(summary) = &completed_job {
@@ -321,13 +435,14 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
                 .timeout_ms
                 .saturating_sub(now_ms().saturating_sub(condition.created_at_ms)),
         );
-        let check = match run_check(state_dir, &condition, remaining) {
+        let check = match run_check(state_dir, &condition, &owner_id, remaining) {
             Ok(check) => check,
             Err(error) => {
                 let Some(failed) = update_waiting_condition(
                     state_dir,
                     &input.session_id,
                     &condition_id,
+                    &owner_id,
                     "record condition failure",
                     |current| {
                         current.attempts += 1;
@@ -346,6 +461,7 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
             state_dir,
             &input.session_id,
             &condition_id,
+            &owner_id,
             "record condition check",
             |current| {
                 current.attempts += 1;
@@ -360,7 +476,7 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
                     current.status = ConditionStatus::Armed;
                     current.checkpoints += 1;
                     current.next_checkpoint_at_ms = current
-                        .check_every_ms
+                        .checkpoint_every_ms
                         .map(|interval| observed_at_ms.saturating_add(interval));
                 }
             },
@@ -385,7 +501,7 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
             .map(|checkpoint| checkpoint.saturating_sub(now_ms()))
             .unwrap_or(u64::MAX);
         let sleep_for =
-            Duration::from_millis(condition.interval_ms.min(remaining_ms).min(checkpoint_ms));
+            Duration::from_millis(condition.poll_every_ms.min(remaining_ms).min(checkpoint_ms));
         if !sleep_for.is_zero() {
             thread::sleep(sleep_for);
         }
@@ -420,18 +536,18 @@ fn validate_request(request: &ArmRequest) -> Result<(), String> {
             MAX_CONDITION_TIMEOUT.as_secs()
         ));
     }
-    if request.interval < MIN_POLL_INTERVAL {
-        return Err("--interval must be at least 50ms".to_owned());
+    if request.poll_every < MIN_POLL_INTERVAL {
+        return Err("--poll-every must be at least 50ms".to_owned());
     }
     if request.check_timeout.is_zero() {
         return Err("--check-timeout must be greater than zero".to_owned());
     }
-    if let Some(check_every) = request.check_every {
-        if check_every < MIN_CHECKPOINT_INTERVAL {
-            return Err("--check-every must be at least 100ms".to_owned());
+    if let Some(checkpoint_every) = request.checkpoint_every {
+        if checkpoint_every < MIN_CHECKPOINT_INTERVAL {
+            return Err("--checkpoint-every must be at least 1m".to_owned());
         }
-        if check_every >= request.timeout {
-            return Err("--check-every must be shorter than --timeout".to_owned());
+        if checkpoint_every >= request.timeout {
+            return Err("--checkpoint-every must be shorter than --timeout".to_owned());
         }
     }
     if !request.cwd.is_dir() {
@@ -446,9 +562,10 @@ fn validate_request(request: &ArmRequest) -> Result<(), String> {
 fn run_check(
     state_dir: &Path,
     condition: &Condition,
+    owner_id: &str,
     remaining: Duration,
 ) -> Result<CheckResult, String> {
-    let output_path = condition_check_output_path(state_dir, condition);
+    let output_path = condition_check_output_path(state_dir, condition, owner_id);
     let result = run_check_with_output(condition, remaining, &output_path);
     let _ = fs::remove_file(output_path);
     result
@@ -504,6 +621,28 @@ fn run_check_with_output(
 fn mark_resolved(condition: &mut Condition, status: ConditionStatus) {
     condition.status = status;
     condition.resolved_at_ms = Some(now_ms());
+}
+
+fn migrate_condition_to_v2(condition: &mut Condition) {
+    let observed_at_ms = now_ms();
+    let remaining_timeout_ms = condition
+        .timeout_ms
+        .saturating_sub(observed_at_ms.saturating_sub(condition.created_at_ms));
+    let legacy_checkpoint_every_ms = condition.checkpoint_every_ms;
+    let migrated_checkpoint_every_ms = legacy_checkpoint_every_ms
+        .map(|interval_ms| interval_ms.max(duration_ms(MIN_CHECKPOINT_INTERVAL)));
+    let migrated_checkpoint_every_ms =
+        migrated_checkpoint_every_ms.filter(|interval_ms| *interval_ms < remaining_timeout_ms);
+
+    condition.version = 2;
+    let preserve_next_checkpoint = legacy_checkpoint_every_ms.is_some()
+        && legacy_checkpoint_every_ms == migrated_checkpoint_every_ms
+        && condition.next_checkpoint_at_ms.is_some();
+    condition.checkpoint_every_ms = migrated_checkpoint_every_ms;
+    if !preserve_next_checkpoint {
+        condition.next_checkpoint_at_ms = migrated_checkpoint_every_ms
+            .map(|interval_ms| observed_at_ms.saturating_add(interval_ms));
+    }
 }
 
 fn format_continuation(condition: &Condition) -> String {
@@ -591,16 +730,138 @@ fn condition_lock_path(state_dir: &Path, session_id: &str) -> PathBuf {
     state_dir.join(format!(".{}.lock", safe_name(session_id)))
 }
 
-fn condition_check_output_path(state_dir: &Path, condition: &Condition) -> PathBuf {
+fn condition_check_output_path(state_dir: &Path, condition: &Condition, owner_id: &str) -> PathBuf {
     state_dir.join(format!(
-        "{}.{}.last-check.log",
+        "{}.{}.{}.last-check.log",
         safe_name(&condition.session_id),
-        safe_name(&condition.id)
+        safe_name(&condition.id),
+        safe_name(owner_id)
     ))
 }
 
+fn hook_lease_path(state_dir: &Path, session_id: &str) -> PathBuf {
+    state_dir.join(format!(".{}.owner.json", safe_name(session_id)))
+}
+
+fn watcher_status(
+    condition_path: &Path,
+    condition: &Condition,
+    observed_at_ms: u64,
+) -> WatcherStatus {
+    if condition.status == ConditionStatus::Armed {
+        return WatcherStatus {
+            state: WatcherState::Armed,
+            condition_id: condition.id.clone(),
+            owner_id: None,
+            pid: None,
+            heartbeat_at_ms: None,
+            heartbeat_age_ms: None,
+            lease_error: None,
+        };
+    }
+    if !condition.status.is_active() {
+        return WatcherStatus {
+            state: WatcherState::Inactive,
+            condition_id: condition.id.clone(),
+            owner_id: None,
+            pid: None,
+            heartbeat_at_ms: None,
+            heartbeat_age_ms: None,
+            lease_error: None,
+        };
+    }
+
+    let lease_path = hook_lease_path(
+        condition_path.parent().unwrap_or_else(|| Path::new(".")),
+        &condition.session_id,
+    );
+    match read_hook_lease(&lease_path) {
+        Ok(lease) => {
+            let heartbeat_age_ms = observed_at_ms.saturating_sub(lease.heartbeat_at_ms);
+            let matches_condition = lease.condition_id == condition.id;
+            let future_heartbeat = lease.heartbeat_at_ms > observed_at_ms.saturating_add(1_000);
+            let process_alive = process_exists(lease.pid);
+            let alive = matches_condition
+                && !future_heartbeat
+                && process_alive
+                && heartbeat_age_ms <= duration_ms(HOOK_LEASE_STALE_AFTER);
+            let lease_error = if future_heartbeat {
+                Some("hook lease heartbeat is in the future".to_owned())
+            } else if !process_alive {
+                Some("hook process no longer exists".to_owned())
+            } else {
+                None
+            };
+            WatcherStatus {
+                state: if alive {
+                    WatcherState::Alive
+                } else {
+                    WatcherState::Stale
+                },
+                condition_id: condition.id.clone(),
+                owner_id: Some(lease.owner_id),
+                pid: Some(lease.pid),
+                heartbeat_at_ms: Some(lease.heartbeat_at_ms),
+                heartbeat_age_ms: Some(heartbeat_age_ms),
+                lease_error,
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let legacy_recent = condition.version == 1
+                && !legacy_condition_is_stale(condition_path, condition, observed_at_ms);
+            WatcherStatus {
+                state: if legacy_recent {
+                    WatcherState::LegacyUnknown
+                } else {
+                    WatcherState::Stale
+                },
+                condition_id: condition.id.clone(),
+                owner_id: None,
+                pid: None,
+                heartbeat_at_ms: None,
+                heartbeat_age_ms: None,
+                lease_error: None,
+            }
+        }
+        Err(error) => WatcherStatus {
+            state: WatcherState::Stale,
+            condition_id: condition.id.clone(),
+            owner_id: None,
+            pid: None,
+            heartbeat_at_ms: None,
+            heartbeat_age_ms: None,
+            lease_error: Some(error.to_string()),
+        },
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn legacy_condition_is_stale(
+    condition_path: &Path,
+    condition: &Condition,
+    observed_at_ms: u64,
+) -> bool {
+    let maximum_update_gap = Duration::from_millis(
+        condition
+            .poll_every_ms
+            .saturating_add(condition.check_timeout_ms),
+    ) + LEGACY_HOOK_GRACE_MARGIN;
+    let grace_ms = duration_ms(maximum_update_gap.max(Duration::from_secs(30)));
+    match fs::metadata(condition_path).and_then(|metadata| metadata.modified()) {
+        Ok(modified) => observed_at_ms.saturating_sub(system_time_ms(modified)) >= grace_ms,
+        Err(_) => true,
+    }
+}
+
 fn lock_condition(state_dir: &Path, session_id: &str) -> Result<File, String> {
-    ensure_state_dir(state_dir).map_err(io_error("create state directory"))?;
+    state::ensure_state_dir(state_dir).map_err(io_error("create state directory"))?;
     let lock_path = condition_lock_path(state_dir, session_id);
     let lock = OpenOptions::new()
         .create(true)
@@ -626,13 +887,24 @@ fn lock_condition(state_dir: &Path, session_id: &str) -> Result<File, String> {
 fn read_waiting_condition(
     path: &Path,
     expected_id: &str,
+    expected_owner_id: &str,
     context: &str,
 ) -> Result<Option<Condition>, String> {
     match read_condition(path) {
         Ok(condition)
             if condition.id == expected_id && condition.status == ConditionStatus::Waiting =>
         {
-            Ok(Some(condition))
+            let lease_path = hook_lease_path(
+                path.parent().unwrap_or_else(|| Path::new(".")),
+                &condition.session_id,
+            );
+            Ok(
+                if hook_lease_is_owned(&lease_path, expected_id, expected_owner_id)? {
+                    Some(condition)
+                } else {
+                    None
+                },
+            )
         }
         Ok(_) => Ok(None),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -644,28 +916,140 @@ fn load_waiting_condition(
     state_dir: &Path,
     session_id: &str,
     expected_id: &str,
+    expected_owner_id: &str,
     context: &'static str,
 ) -> Result<Option<Condition>, String> {
     let _lock = lock_condition(state_dir, session_id)?;
     let path = condition_path(state_dir, session_id);
-    read_waiting_condition(&path, expected_id, context)
+    read_waiting_condition(&path, expected_id, expected_owner_id, context)
 }
 
 fn update_waiting_condition(
     state_dir: &Path,
     session_id: &str,
     expected_id: &str,
+    expected_owner_id: &str,
     context: &'static str,
     update: impl FnOnce(&mut Condition),
 ) -> Result<Option<Condition>, String> {
     let _lock = lock_condition(state_dir, session_id)?;
     let path = condition_path(state_dir, session_id);
-    let Some(mut condition) = read_waiting_condition(&path, expected_id, context)? else {
+    let Some(mut condition) =
+        read_waiting_condition(&path, expected_id, expected_owner_id, context)?
+    else {
         return Ok(None);
     };
+    let mut lease = read_hook_lease(&hook_lease_path(state_dir, session_id))
+        .map_err(|error| format!("{context}: read hook lease: {error}"))?;
     update(&mut condition);
     write_condition(&path, &condition).map_err(|error| format!("{context}: {error}"))?;
+    if condition.status.is_active() {
+        lease.heartbeat_at_ms = now_ms();
+        write_hook_lease(&hook_lease_path(state_dir, session_id), &lease)
+            .map_err(|error| format!("{context}: refresh hook lease: {error}"))?;
+    } else {
+        let _ = fs::remove_file(hook_lease_path(state_dir, session_id));
+    }
     Ok(Some(condition))
+}
+
+fn hook_lease_is_owned(
+    lease_path: &Path,
+    condition_id: &str,
+    owner_id: &str,
+) -> Result<bool, String> {
+    match read_hook_lease(lease_path) {
+        Ok(lease) => Ok(lease.condition_id == condition_id && lease.owner_id == owner_id),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("read hook lease: {error}")),
+    }
+}
+
+fn read_hook_lease(path: &Path) -> io::Result<HookLease> {
+    let file = File::open(path)?;
+    let lease: HookLease = serde_json::from_reader(file)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    validate_hook_lease(&lease)?;
+    Ok(lease)
+}
+
+fn write_hook_lease(path: &Path, lease: &HookLease) -> io::Result<()> {
+    validate_hook_lease(lease)?;
+    state::write_private_json(path, lease, "owner")
+}
+
+fn validate_hook_lease(lease: &HookLease) -> io::Result<()> {
+    if lease.version != 1
+        || lease.pid == 0
+        || lease.pid > i32::MAX as u32
+        || lease.condition_id.is_empty()
+        || lease.owner_id.is_empty()
+    {
+        return Err(io::Error::other("invalid hook owner lease"));
+    }
+    Ok(())
+}
+
+fn spawn_hook_heartbeat(
+    state_dir: PathBuf,
+    session_id: String,
+    condition_id: String,
+    owner_id: String,
+) -> HeartbeatGuard {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    thread::spawn(move || {
+        loop {
+            if thread_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(HOOK_LEASE_REFRESH_INTERVAL);
+            if thread_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if !refresh_hook_heartbeat(&state_dir, &session_id, &condition_id, &owner_id) {
+                break;
+            }
+        }
+    });
+    HeartbeatGuard { stop }
+}
+
+struct HeartbeatGuard {
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn refresh_hook_heartbeat(
+    state_dir: &Path,
+    session_id: &str,
+    condition_id: &str,
+    owner_id: &str,
+) -> bool {
+    let Ok(_lock) = lock_condition(state_dir, session_id) else {
+        return false;
+    };
+    let path = condition_path(state_dir, session_id);
+    let Ok(condition) = read_condition(&path) else {
+        return false;
+    };
+    if condition.id != condition_id || condition.status != ConditionStatus::Waiting {
+        return false;
+    }
+    let lease_path = hook_lease_path(state_dir, session_id);
+    let Ok(mut lease) = read_hook_lease(&lease_path) else {
+        return false;
+    };
+    if lease.condition_id != condition_id || lease.owner_id != owner_id {
+        return false;
+    }
+    lease.heartbeat_at_ms = now_ms();
+    write_hook_lease(&lease_path, &lease).is_ok()
 }
 
 fn safe_name(value: &str) -> String {
@@ -683,32 +1067,61 @@ fn safe_name(value: &str) -> String {
 
 fn read_condition(path: &Path) -> io::Result<Condition> {
     let file = File::open(path)?;
-    serde_json::from_reader(file).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let condition: Condition = serde_json::from_reader(file)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    validate_condition(&condition)?;
+    Ok(condition)
 }
 
 fn write_condition(path: &Path, condition: &Condition) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("condition path has no parent"))?;
-    ensure_state_dir(parent)?;
-    let temporary = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or("condition"),
-        std::process::id()
-    ));
-    let mut file = open_private_truncate(&temporary)?;
-    let result = (|| {
-        serde_json::to_writer_pretty(&mut file, condition).map_err(io::Error::other)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
+    validate_condition(condition)?;
+    state::write_private_json(path, condition, "condition")
+}
+
+fn validate_condition(condition: &Condition) -> io::Result<()> {
+    if !matches!(condition.version, 1 | 2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported condition version {}", condition.version),
+        ));
     }
-    result
+    if condition.timeout_ms == 0 {
+        return Err(io::Error::other(
+            "condition timeout must be greater than zero",
+        ));
+    }
+    if condition.poll_every_ms < duration_ms(MIN_POLL_INTERVAL) {
+        return Err(io::Error::other("condition poll interval is too short"));
+    }
+    if condition.check_timeout_ms == 0 {
+        return Err(io::Error::other(
+            "condition check timeout must be greater than zero",
+        ));
+    }
+    if condition.version == 2
+        && let Some(checkpoint_every_ms) = condition.checkpoint_every_ms
+        && (checkpoint_every_ms < duration_ms(MIN_CHECKPOINT_INTERVAL)
+            || checkpoint_every_ms >= condition.timeout_ms)
+    {
+        return Err(io::Error::other("invalid condition checkpoint interval"));
+    }
+    if condition.version == 2
+        && condition.checkpoint_every_ms.is_some() != condition.next_checkpoint_at_ms.is_some()
+    {
+        return Err(io::Error::other("inconsistent condition checkpoint state"));
+    }
+    if condition.version == 2
+        && condition
+            .next_checkpoint_at_ms
+            .is_some_and(|checkpoint_at_ms| {
+                checkpoint_at_ms > condition.created_at_ms.saturating_add(condition.timeout_ms)
+            })
+    {
+        return Err(io::Error::other(
+            "condition checkpoint is after its deadline",
+        ));
+    }
+    Ok(())
 }
 
 fn open_private_truncate(path: &Path) -> io::Result<File> {
@@ -718,11 +1131,6 @@ fn open_private_truncate(path: &Path) -> io::Result<File> {
         .write(true)
         .mode(0o600)
         .open(path)
-}
-
-fn ensure_state_dir(path: &Path) -> io::Result<()> {
-    fs::create_dir_all(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 fn read_tail(path: &Path, max_bytes: usize) -> io::Result<String> {
@@ -750,6 +1158,14 @@ fn new_condition_id() -> String {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn system_time_ms(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .try_into()

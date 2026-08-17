@@ -12,6 +12,8 @@ research.
 - A detached Unix supervisor for small local jobs, exact exit/signal records,
   persistent combined logs, and a path-only `logs` command.
 - Optional recurring checkpoints that keep the same condition and job active.
+- Recoverable hook-owner leases for interrupted `waiting` conditions, explicit
+  local `--poll-every` semantics, and rate-limited model-visible checkpoints.
 - Success, timeout, failure, replacement, and cancellation outcomes.
 - Per-project or per-user setup, read-only doctor checks including missed or
   expired conditions, stale job heartbeats, and writable state roots,
@@ -55,9 +57,6 @@ instead of guessed abstractions.
   guesses after a stale heartbeat.
 - Add explicit job retention and garbage collection with age/size previews;
   never silently delete logs. Consider optional log rotation or a disk budget.
-- Detect abandoned `waiting` conditions before their deadline after a hook
-  crash or host restart. Expired, legacy-cancelled, and zero-attempt conditions
-  attached to terminal or stale jobs are already covered.
 - Add a machine-readable event schema for arm, check, wake, timeout, and cancel
   outcomes while keeping model-visible output bounded.
 - Add adaptive checkpoints based on log/activity changes after fixed periodic

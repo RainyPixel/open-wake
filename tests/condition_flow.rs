@@ -1,13 +1,17 @@
 use open_wake::{
-    ArmRequest, ConditionStatus, HookResult, StopHookInput, arm, cancel, cancel_if_current,
-    handle_stop_hook, status,
+    ArmRequest, ConditionStatus, HookResult, StopHookInput, WatcherState, arm, cancel,
+    cancel_if_current, handle_stop_hook, inspect_condition, status,
 };
+use std::ffi::CString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod common;
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -55,9 +59,9 @@ fn request(cwd: &Path, session_id: &str, command: Vec<String>) -> ArmRequest {
         cwd: cwd.to_owned(),
         command,
         timeout: Duration::from_secs(2),
-        interval: Duration::from_millis(50),
+        poll_every: Duration::from_millis(50),
         check_timeout: Duration::from_secs(1),
-        check_every: None,
+        checkpoint_every: None,
         job: None,
     }
 }
@@ -67,6 +71,72 @@ fn set_record_status(state: &Path, session_id: &str, status: &str) {
     let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     record["status"] = status.into();
     fs::write(path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+}
+
+fn make_record_version_one(state: &Path, session_id: &str) {
+    let path = state.join(format!("{session_id}.json"));
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["version"] = 1.into();
+    record["interval_ms"] = record["poll_every_ms"].clone();
+    if let Some(checkpoint) = record.get("checkpoint_every_ms") {
+        record["check_every_ms"] = checkpoint.clone();
+    }
+    record.as_object_mut().unwrap().remove("poll_every_ms");
+    record
+        .as_object_mut()
+        .unwrap()
+        .remove("checkpoint_every_ms");
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+}
+
+fn age_file(path: &Path, seconds: i64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let time = libc::timeval {
+        tv_sec: now - seconds,
+        tv_usec: 0,
+    };
+    let times = [time, time];
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let result = unsafe { libc::utimes(path.as_ptr(), times.as_ptr()) };
+    assert_eq!(result, 0);
+}
+
+fn make_hook_owner_stale(state: &Path, session_id: &str, condition_id: &str, attempts: u64) {
+    let path = state.join(format!("{session_id}.json"));
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["status"] = "waiting".into();
+    record["attempts"] = attempts.into();
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let lease_path = state.join(format!(".{session_id}.owner.json"));
+    let heartbeat = crate_now_ms().saturating_sub(30_000);
+    let lease = serde_json::json!({
+        "version": 1,
+        "condition_id": condition_id,
+        "owner_id": "interrupted-hook",
+        "pid": 999999,
+        "heartbeat_at_ms": heartbeat
+    });
+    fs::write(&lease_path, serde_json::to_vec_pretty(&lease).unwrap()).unwrap();
+    fs::write(
+        state.join(format!(
+            "{session_id}.{condition_id}.interrupted-hook.last-check.log"
+        )),
+        "stale output",
+    )
+    .unwrap();
+}
+
+fn crate_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap()
 }
 
 #[test]
@@ -87,9 +157,10 @@ fn checkpoint_wakes_without_resolving_or_restarting_the_condition() {
             ),
         ],
     );
-    request.timeout = Duration::from_secs(3);
-    request.check_every = Some(Duration::from_millis(150));
+    request.timeout = Duration::from_secs(120);
+    request.checkpoint_every = Some(Duration::from_secs(60));
     arm(state.as_ref(), request).unwrap();
+    common::force_checkpoint_now(state.as_ref(), "thread-checkpoint");
 
     let HookResult::Continue(reason) =
         handle_stop_hook(state.as_ref(), &input("thread-checkpoint")).unwrap()
@@ -212,6 +283,37 @@ fn cancellation_is_terminal_without_a_stop_hook_and_allows_rearming() {
 }
 
 #[test]
+fn rearming_removes_a_stale_owner_from_the_previous_condition() {
+    let state = TestDir::new();
+    let original = arm(
+        state.as_ref(),
+        request(state.as_ref(), "thread-rearm-owner", vec!["true".into()]),
+    )
+    .unwrap();
+    cancel(state.as_ref(), "thread-rearm-owner").unwrap();
+    let owner_path = state.as_ref().join(".thread-rearm-owner.owner.json");
+    fs::write(
+        &owner_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "condition_id": original.id,
+            "owner_id": "old-owner",
+            "pid": 999_999,
+            "heartbeat_at_ms": 0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    arm(
+        state.as_ref(),
+        request(state.as_ref(), "thread-rearm-owner", vec!["true".into()]),
+    )
+    .unwrap();
+    assert!(!owner_path.exists());
+}
+
+#[test]
 fn stale_hook_cannot_overwrite_a_rearmed_condition() {
     let state = TestDir::new();
     let state_path = state.as_ref().to_owned();
@@ -325,6 +427,200 @@ fn a_second_hook_cannot_observe_the_same_condition_concurrently() {
 
     cancel(state.as_ref(), "thread-single-waiter").unwrap();
     assert_eq!(first.join().unwrap(), HookResult::Noop);
+}
+
+#[test]
+fn an_interrupted_hook_is_recovered_by_the_next_stop_hook() {
+    let state = TestDir::new();
+    let ready = state.as_ref().join("recovery-ready");
+    let armed = arm(
+        state.as_ref(),
+        request(
+            state.as_ref(),
+            "thread-hook-recovery",
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!("test -e '{}'", ready.display()),
+            ],
+        ),
+    )
+    .unwrap();
+    make_hook_owner_stale(state.as_ref(), "thread-hook-recovery", &armed.id, 7);
+
+    let snapshot = inspect_condition(state.as_ref(), "thread-hook-recovery")
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.watcher.state, WatcherState::Stale);
+
+    fs::write(&ready, b"").unwrap();
+    let HookResult::Continue(reason) =
+        handle_stop_hook(state.as_ref(), &input("thread-hook-recovery")).unwrap()
+    else {
+        panic!("expected the next Stop hook to recover the condition");
+    };
+    assert!(reason.contains("condition met"));
+
+    let recovered = status(state.as_ref(), "thread-hook-recovery")
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.id, armed.id);
+    assert_eq!(recovered.status, ConditionStatus::Succeeded);
+    assert_eq!(recovered.attempts, 8);
+    assert!(
+        !state
+            .as_ref()
+            .join(format!(
+                "thread-hook-recovery.{}.interrupted-hook.last-check.log",
+                armed.id
+            ))
+            .exists()
+    );
+    assert!(
+        !state
+            .as_ref()
+            .join(".thread-hook-recovery.owner.json")
+            .exists()
+    );
+}
+
+#[test]
+fn version_one_condition_fields_are_read_as_poll_and_checkpoint_fields() {
+    let state = TestDir::new();
+    let mut version_one = request(state.as_ref(), "thread-v1-state", vec!["true".into()]);
+    version_one.timeout = Duration::from_secs(120);
+    version_one.checkpoint_every = Some(Duration::from_secs(60));
+    let armed = arm(state.as_ref(), version_one).unwrap();
+    make_record_version_one(state.as_ref(), "thread-v1-state");
+
+    let migrated = status(state.as_ref(), "thread-v1-state").unwrap().unwrap();
+    assert_eq!(migrated.id, armed.id);
+    assert_eq!(migrated.poll_every_ms, 50);
+    assert_eq!(migrated.checkpoint_every_ms, Some(60_000));
+}
+
+#[test]
+fn a_recent_version_one_waiting_record_is_not_stolen_from_a_legacy_hook() {
+    let state = TestDir::new();
+    arm(
+        state.as_ref(),
+        request(state.as_ref(), "thread-legacy-recent", vec!["true".into()]),
+    )
+    .unwrap();
+    make_record_version_one(state.as_ref(), "thread-legacy-recent");
+    set_record_status(state.as_ref(), "thread-legacy-recent", "waiting");
+    let _ = fs::remove_file(state.as_ref().join(".thread-legacy-recent.owner.json"));
+
+    let snapshot = inspect_condition(state.as_ref(), "thread-legacy-recent")
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.watcher.state, WatcherState::LegacyUnknown);
+    assert_eq!(
+        handle_stop_hook(state.as_ref(), &input("thread-legacy-recent")).unwrap(),
+        HookResult::Noop
+    );
+}
+
+#[test]
+fn a_stale_version_one_waiting_record_is_recovered_after_legacy_grace() {
+    let state = TestDir::new();
+    let ready = state.as_ref().join("legacy-ready");
+    arm(
+        state.as_ref(),
+        request(
+            state.as_ref(),
+            "thread-legacy-stale",
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!("test -e '{}'", ready.display()),
+            ],
+        ),
+    )
+    .unwrap();
+    make_record_version_one(state.as_ref(), "thread-legacy-stale");
+    set_record_status(state.as_ref(), "thread-legacy-stale", "waiting");
+    let condition_path = state.as_ref().join("thread-legacy-stale.json");
+    age_file(&condition_path, 31);
+    let _ = fs::remove_file(state.as_ref().join(".thread-legacy-stale.owner.json"));
+
+    let snapshot = inspect_condition(state.as_ref(), "thread-legacy-stale")
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.watcher.state, WatcherState::Stale);
+    fs::write(&ready, b"").unwrap();
+    let HookResult::Continue(reason) =
+        handle_stop_hook(state.as_ref(), &input("thread-legacy-stale")).unwrap()
+    else {
+        panic!("expected stale legacy condition recovery");
+    };
+    assert!(reason.contains("condition met"));
+}
+
+#[test]
+fn a_rapid_legacy_checkpoint_is_migrated_to_the_v2_minimum() {
+    let state = TestDir::new();
+    arm(
+        state.as_ref(),
+        request(
+            state.as_ref(),
+            "thread-legacy-checkpoint",
+            vec!["true".into()],
+        ),
+    )
+    .unwrap();
+    make_record_version_one(state.as_ref(), "thread-legacy-checkpoint");
+    let path = state.as_ref().join("thread-legacy-checkpoint.json");
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["timeout_ms"] = 120_000.into();
+    record["check_every_ms"] = 150_u64.into();
+    record["next_checkpoint_at_ms"] = (record["created_at_ms"].as_u64().unwrap() + 150).into();
+    record["status"] = "waiting".into();
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    age_file(&path, 31);
+    let _ = fs::remove_file(state.as_ref().join(".thread-legacy-checkpoint.owner.json"));
+
+    let HookResult::Continue(reason) =
+        handle_stop_hook(state.as_ref(), &input("thread-legacy-checkpoint")).unwrap()
+    else {
+        panic!("expected legacy checkpoint migration to recover");
+    };
+    assert!(reason.contains("condition met"));
+
+    let migrated = status(state.as_ref(), "thread-legacy-checkpoint")
+        .unwrap()
+        .unwrap();
+    assert_eq!(migrated.version, 2);
+    assert_eq!(migrated.checkpoint_every_ms, Some(60_000));
+    assert!(migrated.next_checkpoint_at_ms.unwrap() > migrated.created_at_ms + 150);
+}
+
+#[test]
+fn unsupported_condition_versions_fail_closed() {
+    let state = TestDir::new();
+    arm(
+        state.as_ref(),
+        request(state.as_ref(), "thread-future-state", vec!["true".into()]),
+    )
+    .unwrap();
+    let path = state.as_ref().join("thread-future-state.json");
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["version"] = 3.into();
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let error = status(state.as_ref(), "thread-future-state").unwrap_err();
+    assert!(
+        error.contains("unsupported condition version"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn inspecting_a_missing_condition_does_not_create_state_files() {
+    let state = TestDir::new();
+    let snapshot = inspect_condition(state.as_ref(), "thread-missing").unwrap();
+    assert!(snapshot.is_none());
+    assert_eq!(fs::read_dir(state.as_ref()).unwrap().count(), 0);
 }
 
 #[test]

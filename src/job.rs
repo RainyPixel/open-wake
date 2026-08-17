@@ -1,9 +1,8 @@
 use crate::JobReference;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -18,7 +17,6 @@ const SUPERVISOR_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISOR_START_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 pub const STALE_AFTER: Duration = Duration::from_secs(30);
 static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
-static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobSpec {
@@ -162,7 +160,7 @@ pub fn prepare(
             cwd.display()
         ));
     }
-    ensure_private_dir(root).map_err(io_error("create job root"))?;
+    crate::state::ensure_state_dir(root).map_err(io_error("create job root"))?;
     let root = root
         .canonicalize()
         .map_err(|error| format!("resolve job root {}: {error}", root.display()))?;
@@ -452,53 +450,20 @@ fn checked_job_dir(root: &Path, id: &str) -> Result<PathBuf, String> {
 }
 
 fn write_heartbeat(directory: &Path) -> io::Result<()> {
-    write_bytes(
+    crate::state::write_private_bytes(
         &directory.join("heartbeat"),
         format!("{}\n", now_ms()).as_bytes(),
+        "job",
     )
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
-    bytes.push(b'\n');
-    write_bytes(path, &bytes)
-}
-
-fn write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("job path has no parent"))?;
-    let sequence = NEXT_WRITE.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name().and_then(OsStr::to_str).unwrap_or("job"),
-        std::process::id(),
-        sequence
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    let result = (|| {
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    crate::state::write_private_json(path, value, "job")
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
     let file = File::open(path)?;
     serde_json::from_reader(file).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-fn ensure_private_dir(path: &Path) -> io::Result<()> {
-    fs::create_dir_all(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 fn new_job_id() -> String {

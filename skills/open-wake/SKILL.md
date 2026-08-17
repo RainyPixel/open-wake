@@ -17,11 +17,12 @@ through their own durable authority.
    open-wake run \
      --label "release build" \
      --timeout 1h \
-     --check-every 15m \
+     --checkpoint-every 15m \
      -- cargo build --release
    ```
 
-   Omit `--check-every` when only terminal completion or timeout matters.
+   Omit `--checkpoint-every` when only terminal completion or timeout matters;
+   it creates a model turn on every checkpoint.
 2. For CI, deployments, services, containers, remote jobs, or an existing
    supervisor, define a fast, read-only, idempotent predicate and use `arm`:
 
@@ -29,10 +30,15 @@ through their own durable authority.
    open-wake arm \
      --label "deployment" \
      --timeout 1h \
-     --interval 10s \
+     --poll-every 10s \
      --check-timeout 5s \
+     --checkpoint-every 15m \
      -- deployment-status --ready
    ```
+
+   `--poll-every` only invokes the local predicate and never wakes the model.
+   Use `--checkpoint-every` only when periodic model-visible progress is
+   genuinely required. It must be at least 1m; prefer 5m or longer.
 
 3. Confirm that `run` or `arm` succeeded, briefly tell the user what job,
    condition, deadline, and checkpoint interval were registered, and end the
@@ -46,13 +52,16 @@ through their own durable authority.
 5. On terminal continuation, inspect the recorded exit code, signal, timeout,
    or failure before deciding whether the original task succeeded.
 6. If the user returns manually instead of a hook continuation, run
-   `open-wake status --json`. An active condition with `attempts: 0` after its
-   deadline, or while its attached job is terminal or stale, means the Codex
-   host never invoked the `Stop` hook; do not call that an end-to-end success.
-   Run `open-wake doctor` to preserve the diagnostic evidence, then
-   `open-wake cancel` to release the session immediately. Ask the user to review
-   `/hooks`, trust the exact command, and restart Codex before arming another
-   condition.
+   `open-wake status --json` and inspect `watcher`. An active condition with
+   `attempts: 0` after its deadline, or while its attached job is terminal or
+   stale, means the Codex host never invoked the `Stop` hook; do not call that
+   an end-to-end success. A `waiting` condition with `watcher.state: stale`
+   means its hook was interrupted: report that, finish the turn normally, and
+   let the next Stop invocation recover it. Run `open-wake doctor` for evidence;
+   use `open-wake cancel` only when abandoning notifications, not as a prefix
+   for every new `run`. If doctor reports hook setup or trust problems, ask the
+   user to review `/hooks`, trust the exact command, and restart Codex before
+   arming another condition.
 
 `open-wake cancel` makes the condition terminal immediately and permits a new
 condition in the same Codex session. It stops future wake-ups but does not

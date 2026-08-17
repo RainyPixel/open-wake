@@ -8,8 +8,8 @@ event from stdin. If the session has no active condition, it returns `{}` and
 does not affect Codex.
 
 For an active condition, the hook transitions it from `armed` to `waiting` and
-runs the predicate until one terminal state or a configured checkpoint is
-reached:
+acquires a private hook-owner lease. It runs the predicate until one terminal
+state or a configured checkpoint is reached:
 
 | State | Meaning | Codex continuation |
 | --- | --- | --- |
@@ -23,6 +23,17 @@ condition records the checkpoint, transitions back to `armed`, and keeps its
 original deadline. When that agent turn stops, the next hook invocation resumes
 checking the same predicate. For `run`, the detached command is never launched
 again.
+
+A `waiting` record is not by itself proof that a hook is alive. Its lease
+contains the condition ID, unique owner ID, PID, and heartbeat
+time. The owning hook refreshes the heartbeat while waiting. Liveness requires a
+recent heartbeat and an existing owner PID; PID liveness is checked without
+delivering a signal. The current writer refreshes every second and treats a
+heartbeat older than five seconds as stale. If Codex interrupts the process, a
+later Stop invocation may acquire the stale lease and continue the same
+condition without resetting its ID, attempts, deadline, or checkpoint count.
+Until a legacy version-1 record can be classified safely, a recent record
+without a lease is treated as ownership-unknown.
 
 `cancel` transitions an active condition directly to terminal `cancelled`. It
 does not depend on another Stop event, so the same session can be re-armed even
@@ -49,10 +60,19 @@ The condition authority is local durable state, not a terminal pane. Terminal
 multiplexers are outside the protocol.
 
 Every read-validate-write transition is serialized by a per-session lock. Only
-one hook may transition an `armed` condition to `waiting`. Hook updates require
-the condition ID they started with and continued ownership of `waiting`;
-predicate output is generation-scoped, so a stale hook cannot modify a
-condition after cancellation, checkpoint handoff, or replacement.
+one fresh hook lease may drive a `waiting` generation. Hook updates require the
+condition ID and owner ID they started with; predicate output is
+condition- and owner-scoped, so overlapping predicates from a stale hook and
+recovery hook cannot remove or overwrite each other's temporary output.
+
+New condition records are version 2 and use `poll_every_ms` plus
+`checkpoint_every_ms`. The reader also accepts version-1 `interval_ms` and
+`check_every_ms` fields so an already active condition remains observable after
+an upgrade. On takeover, a legacy checkpoint below one minute is raised to one
+minute, or removed when the remaining overall timeout cannot accommodate it.
+New writes do not preserve the old field names. A binary older than this state
+format cannot read version-2 records, so downgrade after a v2 write requires
+discarding or manually migrating that ephemeral condition.
 
 For `run`, a persistent job directory contains `job.json`, a heartbeat,
 `output.log`, and eventually an atomic `result.json`. The result records the
@@ -75,11 +95,15 @@ bytes still match the embedded version.
 The installed synchronous Stop hook has a seven-day timeout. An armed condition
 must be at least 60 seconds shorter, leaving time for hook startup and result
 delivery. Each predicate also has a shorter independent check timeout. Overall
-deadline accounting includes predicate execution and intervals.
+deadline accounting includes predicate execution and `--poll-every` intervals.
+Model-visible `--checkpoint-every` values must be at least one minute and
+shorter than the timeout; values below five minutes produce a warning.
 
 ## Failure boundaries
 
 - A missing or inactive condition is a no-op.
+- A `waiting` condition with a fresh lease is ignored by another hook. A stale
+  lease is recoverable by the next Stop invocation.
 - Predicate exit statuses other than `0` mean "not ready" and are retried.
 - Failure to start or observe a predicate wakes Codex with `failed` evidence.
 - Failure to acknowledge a `run` supervisor cancels its newly armed condition

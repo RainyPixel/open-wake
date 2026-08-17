@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod common;
+
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
 struct TestDir(PathBuf);
@@ -113,6 +115,59 @@ fn wait_for_file(path: &Path) {
 }
 
 #[test]
+fn polling_and_checkpoint_flags_have_separate_replaced_contracts() {
+    let workspace = TestDir::new();
+    let state = workspace.as_ref().join("state");
+
+    let accepted = Command::new(binary())
+        .args(["arm", "--thread", "cli-contract", "--state-dir"])
+        .arg(&state)
+        .args([
+            "--timeout",
+            "2m",
+            "--poll-every",
+            "50ms",
+            "--checkpoint-every",
+            "1m",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&accepted);
+    assert!(String::from_utf8_lossy(&accepted.stderr).contains("model turn"));
+
+    let old_arm_interval = Command::new(binary())
+        .args(["arm", "--thread", "cli-contract-old", "--state-dir"])
+        .arg(&state)
+        .args(["--timeout", "2m", "--interval", "50ms", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(!old_arm_interval.status.success());
+    assert!(String::from_utf8_lossy(&old_arm_interval.stderr).contains("--interval"));
+
+    let old_run_checkpoint = Command::new(binary())
+        .args(["run", "--thread", "cli-contract-old", "--state-dir"])
+        .arg(&state)
+        .arg("--job-dir")
+        .arg(workspace.as_ref().join("jobs"))
+        .args(["--timeout", "2m", "--check-every", "1m", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(!old_run_checkpoint.status.success());
+    assert!(String::from_utf8_lossy(&old_run_checkpoint.stderr).contains("--check-every"));
+
+    let short_checkpoint = Command::new(binary())
+        .args(["arm", "--thread", "cli-short-checkpoint", "--state-dir"])
+        .arg(&state)
+        .args(["--timeout", "2m", "--checkpoint-every", "30s", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(!short_checkpoint.status.success());
+    assert!(String::from_utf8_lossy(&short_checkpoint.stderr).contains("at least 1m"));
+}
+
+#[test]
 fn run_survives_the_launcher_and_checkpoints_without_restarting() {
     let workspace = TestDir::new();
     let state = workspace.as_ref().join("state");
@@ -132,11 +187,9 @@ fn run_survives_the_launcher_and_checkpoints_without_restarting() {
             .arg(&jobs)
             .args([
                 "--timeout",
-                "5s",
-                "--check-every",
-                "150ms",
-                "--interval",
-                "50ms",
+                "2m",
+                "--checkpoint-every",
+                "1m",
                 "--json",
                 "--",
                 "sh",
@@ -146,6 +199,7 @@ fn run_survives_the_launcher_and_checkpoints_without_restarting() {
             .output()
             .unwrap(),
     );
+    common::force_checkpoint_now(&state, "job-flow");
     let job_id = launch["job_id"].as_str().unwrap();
     let log_path = PathBuf::from(launch["log_path"].as_str().unwrap());
 
@@ -257,7 +311,7 @@ fn stale_hook_process_cannot_overwrite_a_replacement_condition() {
         .args([
             "--timeout",
             "2s",
-            "--interval",
+            "--poll-every",
             "50ms",
             "--check-timeout",
             "1s",
@@ -289,7 +343,7 @@ fn stale_hook_process_cannot_overwrite_a_replacement_condition() {
         .args([
             "--timeout",
             "2s",
-            "--interval",
+            "--poll-every",
             "50ms",
             "--check-timeout",
             "1s",
@@ -316,6 +370,159 @@ fn stale_hook_process_cannot_overwrite_a_replacement_condition() {
     let status = status_json(&state, "process-race");
     assert_eq!(status["status"], "armed");
     assert_eq!(status["attempts"], 0);
+}
+
+#[test]
+fn a_hook_that_loses_a_stale_lease_cannot_overwrite_the_recovery_hook() {
+    let workspace = TestDir::new();
+    let state = workspace.as_ref().join("state");
+    let hook_started = workspace.as_ref().join("hook-started");
+    let release = workspace.as_ref().join("release");
+    let predicate = format!(
+        "touch '{}'; while ! test -e '{}'; do sleep 0.02; done; exit 0",
+        hook_started.display(),
+        release.display()
+    );
+    let _ = std::fs::remove_file(&release);
+
+    let armed = Command::new(binary())
+        .args(["arm", "--thread", "lease-takeover", "--state-dir"])
+        .arg(&state)
+        .args([
+            "--timeout",
+            "5s",
+            "--poll-every",
+            "50ms",
+            "--check-timeout",
+            "1s",
+            "--",
+            "sh",
+            "-c",
+            &predicate,
+        ])
+        .output()
+        .unwrap();
+    assert_success(&armed);
+    let condition: Value = serde_json::from_slice(
+        &Command::new(binary())
+            .args(["status", "--thread", "lease-takeover", "--state-dir"])
+            .arg(&state)
+            .arg("--json")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let condition_id = condition["id"].as_str().unwrap().to_owned();
+
+    let first_hook = spawn_stop_hook(&state, "lease-takeover");
+    wait_for_file(&hook_started);
+    let _ = fs::remove_file(&hook_started);
+
+    let heartbeat = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        - 30_000;
+    let stale_lease = json!({
+        "version": 1,
+        "condition_id": condition_id,
+        "owner_id": "old-owner",
+        "pid": 999_999,
+        "heartbeat_at_ms": heartbeat
+    });
+    fs::write(
+        state.join(".lease-takeover.owner.json"),
+        serde_json::to_vec_pretty(&stale_lease).unwrap(),
+    )
+    .unwrap();
+
+    let second_hook = spawn_stop_hook(&state, "lease-takeover");
+    let takeover_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let watcher = status_json(&state, "lease-takeover")["watcher"].clone();
+        if watcher["state"] == "alive" && watcher["owner_id"].as_str() != Some("old-owner") {
+            break;
+        }
+        assert!(
+            Instant::now() < takeover_deadline,
+            "second hook did not acquire the stale lease"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    wait_for_file(&hook_started);
+    fs::write(&release, b"").unwrap();
+
+    let first_output = first_hook.wait_with_output().unwrap();
+    assert_eq!(successful_json(first_output), json!({}));
+    let second_output = second_hook.wait_with_output().unwrap();
+    let second_result = successful_json(second_output);
+    assert_eq!(second_result["decision"], "block");
+    assert!(
+        second_result["reason"]
+            .as_str()
+            .unwrap()
+            .contains("condition met"),
+        "unexpected recovery result: {second_result}"
+    );
+
+    let final_status = status_json(&state, "lease-takeover");
+    assert_eq!(final_status["status"], "succeeded");
+    assert_eq!(final_status["attempts"], 1);
+}
+
+#[test]
+fn hook_heartbeats_keep_a_live_lease_authoritative() {
+    let workspace = TestDir::new();
+    let state = workspace.as_ref().join("state");
+    let started = workspace.as_ref().join("started");
+    let predicate = format!("touch '{}'; sleep 1.25; exit 1", started.display());
+    let armed = Command::new(binary())
+        .args(["arm", "--thread", "live-lease", "--state-dir"])
+        .arg(&state)
+        .args([
+            "--timeout",
+            "5s",
+            "--poll-every",
+            "50ms",
+            "--check-timeout",
+            "2s",
+            "--",
+            "sh",
+            "-c",
+            &predicate,
+        ])
+        .output()
+        .unwrap();
+    assert_success(&armed);
+
+    let hook = spawn_stop_hook(&state, "live-lease");
+    wait_for_file(&started);
+    let initial = status_json(&state, "live-lease")["watcher"]["heartbeat_at_ms"]
+        .as_u64()
+        .unwrap();
+    let refreshed_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let watcher = status_json(&state, "live-lease")["watcher"].clone();
+        assert_eq!(watcher["state"], "alive");
+        if watcher["heartbeat_at_ms"].as_u64().unwrap() > initial {
+            break;
+        }
+        assert!(
+            Instant::now() < refreshed_deadline,
+            "hook lease heartbeat was not refreshed"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(stop_hook(&state, "live-lease"), json!({}));
+    Command::new(binary())
+        .args(["cancel", "--thread", "live-lease", "--state-dir"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    let output = hook.wait_with_output().unwrap();
+    assert_eq!(successful_json(output), json!({}));
 }
 
 #[test]

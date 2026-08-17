@@ -1,8 +1,8 @@
 use crate::setup::{InstallScope, SetupTarget, inspect_hook, inspect_hook_enabled, inspect_skill};
 use crate::update::check_for_update_cached;
 use crate::{
-    ArmRequest, ConditionStatus, StopHookInput, arm, directory_can_be_created, handle_stop_hook,
-    status,
+    ArmRequest, Condition, ConditionStatus, StopHookInput, WatcherState, WatcherStatus, arm,
+    directory_can_be_created, handle_stop_hook, inspect_condition, status,
 };
 use crate::{job, job::JobState};
 use serde::Serialize;
@@ -130,75 +130,21 @@ fn inspect_condition_at(
     observed_at_ms: u64,
     report: &mut DoctorReport,
 ) {
-    match status(state_dir, session_id) {
-        Ok(Some(condition)) if condition.status.is_active() => {
-            let elapsed_ms = observed_at_ms.saturating_sub(condition.created_at_ms);
-            let expired = elapsed_ms >= condition.timeout_ms;
-            let job_observation = condition
-                .job
-                .as_ref()
-                .map(|reference| job::snapshot(&reference.root, &reference.id));
-            let job_error = job_observation
-                .as_ref()
-                .and_then(|observation| observation.as_ref().err());
-            let unobserved_ready_job = condition.status == ConditionStatus::Armed
-                && condition.attempts == 0
-                && job_observation.as_ref().is_some_and(|observation| {
-                    observation.as_ref().is_ok_and(|job| job.is_ready())
-                });
-            let never_observed = condition.attempts == 0 && (expired || unobserved_ready_job);
-            let unhealthy = expired || unobserved_ready_job || job_error.is_some();
-            report.push(DoctorCheck {
-                name: "active_condition".to_owned(),
-                status: if unhealthy {
-                    CheckStatus::Fail
-                } else {
-                    CheckStatus::Pass
-                },
-                detail: if let Some(error) = job_error {
-                    format!(
-                        "condition {} has an unavailable attached job: {error}",
-                        condition.id
-                    )
-                } else if unobserved_ready_job {
-                    format!(
-                        "condition {} is still Armed with zero attempts although its attached job is terminal or stale; Codex did not invoke the Stop hook",
-                        condition.id
-                    )
-                } else if never_observed {
-                    format!(
-                        "condition {} passed its deadline with zero attempts; Codex did not invoke the Stop hook",
-                        condition.id
-                    )
-                } else if expired {
-                    format!(
-                        "condition {} remains {:?} after its deadline ({} attempts)",
-                        condition.id, condition.status, condition.attempts
-                    )
-                } else {
-                    format!(
-                        "condition {} is {:?} ({} attempts)",
-                        condition.id, condition.status, condition.attempts
-                    )
-                },
-                fix: if job_error.is_some() {
-                    Some(
-                        "inspect the recorded job root, log, and process authority before cancelling; do not launch a replacement while the command outcome is unknown"
-                            .to_owned(),
-                    )
-                } else {
-                    unhealthy.then(|| {
-                        "run `open-wake cancel` to release this session, then open `/hooks`, verify and trust the exact command, and restart Codex before arming another condition"
-                            .to_owned()
-                    })
-                },
-            });
+    match inspect_condition(state_dir, session_id) {
+        Ok(Some(snapshot)) if snapshot.condition.status.is_active() => {
+            inspect_active_condition(
+                &snapshot.condition,
+                &snapshot.watcher,
+                observed_at_ms,
+                report,
+            );
         }
-        Ok(Some(condition))
-            if condition.status == ConditionStatus::CancelRequested
-                || (condition.status == ConditionStatus::Cancelled
-                    && condition.resolved_at_ms.is_none()) =>
+        Ok(Some(snapshot))
+            if matches!(snapshot.condition.status, ConditionStatus::CancelRequested)
+                || (snapshot.condition.status == ConditionStatus::Cancelled
+                    && snapshot.condition.resolved_at_ms.is_none()) =>
         {
+            let condition = snapshot.condition;
             let elapsed_ms = observed_at_ms.saturating_sub(condition.created_at_ms);
             let missed_hook = elapsed_ms >= condition.timeout_ms && condition.attempts == 0;
             report.push(DoctorCheck {
@@ -236,6 +182,90 @@ fn inspect_condition_at(
             fix: Some("inspect the condition state directory and rerun doctor".to_owned()),
         }),
     }
+}
+
+fn inspect_active_condition(
+    condition: &Condition,
+    watcher: &WatcherStatus,
+    observed_at_ms: u64,
+    report: &mut DoctorReport,
+) {
+    let elapsed_ms = observed_at_ms.saturating_sub(condition.created_at_ms);
+    let expired = elapsed_ms >= condition.timeout_ms;
+    let job_observation = condition
+        .job
+        .as_ref()
+        .map(|reference| job::snapshot(&reference.root, &reference.id));
+    let job_error = job_observation
+        .as_ref()
+        .and_then(|observation| observation.as_ref().err());
+    let unobserved_ready_job = condition.status == ConditionStatus::Armed
+        && condition.attempts == 0
+        && job_observation
+            .as_ref()
+            .is_some_and(|observation| observation.as_ref().is_ok_and(|job| job.is_ready()));
+    let never_observed = condition.attempts == 0 && (expired || unobserved_ready_job);
+    let stale_watcher =
+        condition.status == ConditionStatus::Waiting && watcher.state == WatcherState::Stale;
+    let legacy_watcher = condition.status == ConditionStatus::Waiting
+        && watcher.state == WatcherState::LegacyUnknown;
+    let unhealthy = expired || unobserved_ready_job || job_error.is_some() || stale_watcher;
+    let fix = if job_error.is_some() {
+        Some(
+            "inspect the recorded job root, log, and process authority before cancelling; do not launch a replacement while the command outcome is unknown"
+                .to_owned(),
+        )
+    } else if stale_watcher {
+        Some(
+            "finish the current Codex turn so the next Stop hook can recover this condition; run `open-wake cancel` only to abandon notifications"
+                .to_owned(),
+        )
+    } else if unhealthy {
+        Some(
+            "run `open-wake cancel` to release this session, then open `/hooks`, verify and trust the exact command, and restart Codex before arming another condition"
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+
+    report.push(DoctorCheck {
+        name: "active_condition".to_owned(),
+        status: if unhealthy {
+            CheckStatus::Fail
+        } else if legacy_watcher {
+            CheckStatus::Warn
+        } else {
+            CheckStatus::Pass
+        },
+        detail: if let Some(error) = job_error {
+            format!(
+                "condition {} has an unavailable attached job: {error}",
+                condition.id
+            )
+        } else if unobserved_ready_job {
+            format!(
+                "condition {} is still Armed with zero attempts although its attached job is terminal or stale; Codex did not invoke the Stop hook",
+                condition.id
+            )
+        } else if never_observed {
+            format!(
+                "condition {} passed its deadline with zero attempts; Codex did not invoke the Stop hook",
+                condition.id
+            )
+        } else if expired {
+            format!(
+                "condition {} remains {:?} after its deadline ({} attempts; watcher {:?})",
+                condition.id, condition.status, condition.attempts, watcher.state
+            )
+        } else {
+            format!(
+                "condition {} is {:?} with watcher {:?} ({} attempts)",
+                condition.id, condition.status, watcher.state, condition.attempts
+            )
+        },
+        fix,
+    });
 }
 
 fn observed_at_ms() -> u64 {
@@ -539,9 +569,9 @@ fn protocol_smoke_test() -> Result<(), String> {
                 "printf doctor-ok".to_owned(),
             ],
             timeout: Duration::from_secs(2),
-            interval: Duration::from_millis(50),
+            poll_every: Duration::from_millis(50),
             check_timeout: Duration::from_secs(1),
-            check_every: None,
+            checkpoint_every: None,
             job: None,
         },
     )?;
@@ -626,9 +656,9 @@ mod tests {
                 cwd: workspace.as_ref().to_owned(),
                 command: vec!["true".to_owned()],
                 timeout,
-                interval: Duration::from_millis(50),
+                poll_every: Duration::from_millis(50),
                 check_timeout: Duration::from_millis(50),
-                check_every: None,
+                checkpoint_every: None,
                 job,
             },
         )
@@ -730,6 +760,56 @@ mod tests {
         assert_eq!(check.status, CheckStatus::Fail);
         assert!(check.detail.contains("terminal or stale"));
         assert!(check.detail.contains("did not invoke the Stop hook"));
+        assert!(!report.ok);
+    }
+
+    #[test]
+    fn stale_waiting_hook_is_actionable_before_its_deadline() {
+        let workspace = DoctorDir::new().unwrap();
+        let condition = arm_test_condition(&workspace, "thread", Duration::from_secs(60), None);
+        let condition_path = workspace.as_ref().join("thread.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&condition_path).unwrap()).unwrap();
+        record["status"] = "waiting".into();
+        record["attempts"] = 88.into();
+        fs::write(&condition_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let heartbeat = condition.created_at_ms + 1;
+        let lease = serde_json::json!({
+            "version": 1,
+            "condition_id": condition.id,
+            "owner_id": "interrupted-hook",
+            "pid": 999999,
+            "heartbeat_at_ms": heartbeat
+        });
+        fs::write(
+            workspace.as_ref().join(".thread.owner.json"),
+            serde_json::to_vec_pretty(&lease).unwrap(),
+        )
+        .unwrap();
+
+        let mut report = DoctorReport::new();
+        inspect_condition_at(
+            workspace.as_ref(),
+            "thread",
+            condition.created_at_ms + 1_000,
+            &mut report,
+        );
+
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "active_condition")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.detail.contains("watcher Stale"));
+        assert!(
+            check
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("next Stop hook can recover")
+        );
         assert!(!report.ok);
     }
 
