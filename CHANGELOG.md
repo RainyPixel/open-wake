@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.0](https://github.com/RainyPixel/open-wake/compare/v0.2.4...v0.3.0) (2026-08-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **lifecycle:** remove --interval and --check-every. Use --poll-every for external predicates and --checkpoint-every for model-visible progress checkpoints.
+
+### Features
+
+* **lifecycle:** recover interrupted hooks ([5fd4bb8](https://github.com/RainyPixel/open-wake/commit/5fd4bb847e2423e6dc0fca1e8a5afa662cd986e2))
+
+
+### Bug Fixes
+
+* **release:** keep breaking bumps pre-1.0 ([9277b76](https://github.com/RainyPixel/open-wake/commit/9277b76dddc6d3b4daba4b93cd36d7e85d19fb35))
+
 ## [0.2.4](https://github.com/RainyPixel/open-wake/compare/v0.2.3...v0.2.4) (2026-08-16)
 
 
