@@ -27,6 +27,7 @@ jobs:
         shell: bash
         run: |
           jq -e '
+            .["bump-minor-pre-major"] == true and
             .draft == true and
             .["include-component-in-tag"] == false and
             .["include-v-in-tag"] == true and
