@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0](https://github.com/RainyPixel/open-wake/compare/v0.3.0...v0.4.0) (2026-08-27)
+
+
+### Features
+
+* **lifecycle:** make hook recovery durable ([cbf2a47](https://github.com/RainyPixel/open-wake/commit/cbf2a47858837fcca434e0ab50f270abb1b5f454))
+
+
+### Bug Fixes
+
+* **lifecycle:** use portable guard signal ([6e9ea8b](https://github.com/RainyPixel/open-wake/commit/6e9ea8bce1a210d811b74cafcff49fb0150694c1))
+
 ## [0.3.0](https://github.com/RainyPixel/open-wake/compare/v0.2.4...v0.3.0) (2026-08-20)
 
 
