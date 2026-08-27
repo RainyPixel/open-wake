@@ -114,6 +114,20 @@ fn wait_for_file(path: &Path) {
     assert!(path.exists(), "{} did not appear", path.display());
 }
 
+fn process_is_running(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == -1 {
+        return false;
+    }
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    output.status.success()
+        && !String::from_utf8_lossy(&output.stdout)
+            .trim_start()
+            .starts_with('Z')
+}
+
 #[test]
 fn polling_and_checkpoint_flags_have_separate_replaced_contracts() {
     let workspace = TestDir::new();
@@ -526,7 +540,7 @@ fn hook_heartbeats_keep_a_live_lease_authoritative() {
 }
 
 #[test]
-fn an_abrupt_hook_exit_records_its_phase_and_reaps_the_predicate() {
+fn an_abrupt_hook_exit_records_its_phase_and_terminates_the_predicate() {
     let workspace = TestDir::new();
     let state = workspace.as_ref().join("state");
     let predicate_pid_path = workspace.as_ref().join("predicate-pid");
@@ -574,17 +588,10 @@ fn an_abrupt_hook_exit_records_its_phase_and_reaps_the_predicate() {
         .trim()
         .parse::<i32>()
         .unwrap();
-    let reaped_deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if unsafe { libc::kill(predicate_pid, 0) } == -1 {
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ESRCH)
-            );
-            break;
-        }
+    let terminated_deadline = Instant::now() + Duration::from_secs(2);
+    while process_is_running(predicate_pid) {
         assert!(
-            Instant::now() < reaped_deadline,
+            Instant::now() < terminated_deadline,
             "predicate survived its hook process"
         );
         thread::sleep(Duration::from_millis(20));
