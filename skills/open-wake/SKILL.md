@@ -56,8 +56,12 @@ through their own durable authority.
    `attempts: 0` after its deadline, or while its attached job is terminal or
    stale, means the Codex host never invoked the `Stop` hook; do not call that
    an end-to-end success. A `waiting` condition with `watcher.state: stale`
-   means its hook was interrupted: report that, finish the turn normally, and
-   let the next Stop invocation recover it. Run `open-wake doctor` for evidence;
+   means its hook was interrupted: report its `phase`, `turn_id`, and check
+   timestamps, finish the turn normally, and let the next Stop invocation
+   recover it. A stale `delivering` phase may carry a pending continuation that
+   the next Stop will retry without rerunning the predicate. Classify an
+   explicit operator `turn_aborted` as an expected interruption, not an
+   open-wake crash. Run `open-wake doctor` for evidence;
    use `open-wake cancel` only when abandoning notifications, not as a prefix
    for every new `run`. If doctor reports hook setup or trust problems, ask the
    user to review `/hooks`, trust the exact command, and restart Codex before

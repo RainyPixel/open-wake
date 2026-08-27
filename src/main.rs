@@ -4,8 +4,9 @@ use open_wake::job::{self, JobSnapshot};
 use open_wake::setup::{ChangeKind, InstallScope, SetupReport, SetupTarget, setup, uninstall};
 use open_wake::update::{UpdateReport, check_for_update, install_release};
 use open_wake::{
-    ArmRequest, Condition, StopHookInput, arm, cancel, cancel_if_current, current_session_id,
-    default_state_dir, handle_stop_hook, hook_config, hook_output, inspect_condition, status,
+    ArmRequest, Condition, DeliveryStatus, HookResult, StopHookInput, arm, cancel,
+    cancel_if_current, current_session_id, default_state_dir, deliver_hook_notification,
+    handle_stop_hook, hook_config, hook_output, inspect_condition, status,
 };
 use serde::Serialize;
 use std::env;
@@ -423,11 +424,22 @@ fn run(cli: Cli) -> Result<bool, String> {
             let input: StopHookInput = serde_json::from_str(&input)
                 .map_err(|error| format!("parse Stop hook input: {error}"))?;
             let result = handle_stop_hook(&state_dir, &input)?;
-            println!(
-                "{}",
-                serde_json::to_string(&hook_output(result))
-                    .map_err(|error| format!("serialize hook output: {error}"))?
-            );
+            let needs_acknowledgement = matches!(result, HookResult::Continue(_));
+            let mut output = serde_json::to_vec(&hook_output(result))
+                .map_err(|error| format!("serialize hook output: {error}"))?;
+            output.push(b'\n');
+            if needs_acknowledgement {
+                match deliver_hook_notification(&state_dir, &input, || write_hook_stdout(&output))?
+                {
+                    DeliveryStatus::Delivered => {}
+                    DeliveryStatus::Superseded => write_hook_stdout(b"{}\n")?,
+                    DeliveryStatus::DeliveredButUnacknowledged(error) => eprintln!(
+                        "open-wake: warning: hook output was delivered but its state acknowledgement failed: {error}"
+                    ),
+                }
+            } else {
+                write_hook_stdout(&output)?;
+            }
         }
         Commands::Status(args) => {
             let state_dir = args.state_dir.unwrap_or_else(default_state_dir);
@@ -457,10 +469,12 @@ fn run(cli: Cli) -> Result<bool, String> {
                 );
             } else {
                 println!(
-                    "{}: {:?}, watcher: {:?}, attempts: {}, last exit: {:?}",
+                    "{}: {:?}, watcher: {:?}, phase: {:?}, turn: {:?}, attempts: {}, last exit: {:?}",
                     condition.label.as_deref().unwrap_or(&condition.id),
                     condition.status,
                     snapshot.watcher.state,
+                    snapshot.watcher.phase,
+                    snapshot.watcher.turn_id,
                     condition.attempts,
                     condition.last_exit_code
                 );
@@ -604,6 +618,16 @@ fn run(cli: Cli) -> Result<bool, String> {
         }
     }
     Ok(true)
+}
+
+fn write_hook_stdout(output: &[u8]) -> Result<(), String> {
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(output)
+        .map_err(|error| format!("write hook output: {error}"))?;
+    stdout
+        .flush()
+        .map_err(|error| format!("flush hook output: {error}"))
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {

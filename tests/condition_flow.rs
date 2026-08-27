@@ -1,6 +1,7 @@
 use open_wake::{
-    ArmRequest, ConditionStatus, HookResult, StopHookInput, WatcherState, arm, cancel,
-    cancel_if_current, handle_stop_hook, inspect_condition, status,
+    ArmRequest, ConditionStatus, DeliveryStatus, HookResult, StopHookInput, WatcherState,
+    acknowledge_hook_delivery, arm, cancel, cancel_if_current, deliver_hook_notification,
+    handle_stop_hook, inspect_condition, status,
 };
 use std::ffi::CString;
 use std::fs;
@@ -46,10 +47,24 @@ impl Drop for TestDir {
 }
 
 fn input(session_id: &str) -> StopHookInput {
+    input_for_turn(session_id, "test-turn")
+}
+
+fn input_for_turn(session_id: &str, turn_id: &str) -> StopHookInput {
     StopHookInput {
         session_id: session_id.to_owned(),
+        turn_id: Some(turn_id.to_owned()),
         hook_event_name: "Stop".to_owned(),
     }
+}
+
+fn delivered_stop_hook(state: &Path, session_id: &str) -> HookResult {
+    let input = input(session_id);
+    let result = handle_stop_hook(state, &input).unwrap();
+    if matches!(result, HookResult::Continue(_)) {
+        assert!(acknowledge_hook_delivery(state, &input).unwrap());
+    }
+    result
 }
 
 fn request(cwd: &Path, session_id: &str, command: Vec<String>) -> ArmRequest {
@@ -162,8 +177,7 @@ fn checkpoint_wakes_without_resolving_or_restarting_the_condition() {
     arm(state.as_ref(), request).unwrap();
     common::force_checkpoint_now(state.as_ref(), "thread-checkpoint");
 
-    let HookResult::Continue(reason) =
-        handle_stop_hook(state.as_ref(), &input("thread-checkpoint")).unwrap()
+    let HookResult::Continue(reason) = delivered_stop_hook(state.as_ref(), "thread-checkpoint")
     else {
         panic!("expected checkpoint continuation");
     };
@@ -175,8 +189,7 @@ fn checkpoint_wakes_without_resolving_or_restarting_the_condition() {
     assert_eq!(condition.checkpoints, 1);
 
     fs::write(&ready, b"").unwrap();
-    let HookResult::Continue(reason) =
-        handle_stop_hook(state.as_ref(), &input("thread-checkpoint")).unwrap()
+    let HookResult::Continue(reason) = delivered_stop_hook(state.as_ref(), "thread-checkpoint")
     else {
         panic!("expected completion continuation");
     };
@@ -204,7 +217,7 @@ fn successful_predicate_becomes_one_continuation() {
     )
     .unwrap();
 
-    let result = handle_stop_hook(state.as_ref(), &input("thread-success")).unwrap();
+    let result = delivered_stop_hook(state.as_ref(), "thread-success");
     let HookResult::Continue(reason) = result else {
         panic!("expected continuation");
     };
@@ -233,7 +246,7 @@ fn false_predicate_continues_at_deadline_with_last_result() {
     request.timeout = Duration::from_secs(2);
     arm(state.as_ref(), request).unwrap();
 
-    let result = handle_stop_hook(state.as_ref(), &input("thread-timeout")).unwrap();
+    let result = delivered_stop_hook(state.as_ref(), "thread-timeout");
     let HookResult::Continue(reason) = result else {
         panic!("expected deadline continuation");
     };
@@ -454,8 +467,7 @@ fn an_interrupted_hook_is_recovered_by_the_next_stop_hook() {
     assert_eq!(snapshot.watcher.state, WatcherState::Stale);
 
     fs::write(&ready, b"").unwrap();
-    let HookResult::Continue(reason) =
-        handle_stop_hook(state.as_ref(), &input("thread-hook-recovery")).unwrap()
+    let HookResult::Continue(reason) = delivered_stop_hook(state.as_ref(), "thread-hook-recovery")
     else {
         panic!("expected the next Stop hook to recover the condition");
     };
@@ -485,6 +497,191 @@ fn an_interrupted_hook_is_recovered_by_the_next_stop_hook() {
 }
 
 #[test]
+fn a_terminal_notification_is_retried_after_pre_delivery_interruption() {
+    let state = TestDir::new();
+    let attempts = state.as_ref().join("attempts");
+    let armed = arm(
+        state.as_ref(),
+        request(
+            state.as_ref(),
+            "thread-delivery-recovery",
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!("printf x >>'{}'; exit 0", attempts.display()),
+            ],
+        ),
+    )
+    .unwrap();
+
+    let first_input = input_for_turn("thread-delivery-recovery", "interrupted-turn");
+    let HookResult::Continue(first_reason) =
+        handle_stop_hook(state.as_ref(), &first_input).unwrap()
+    else {
+        panic!("expected a pending terminal notification");
+    };
+    let pending = status(state.as_ref(), "thread-delivery-recovery")
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status, ConditionStatus::Waiting);
+    assert_eq!(
+        pending.pending_notification.as_ref().unwrap().kind,
+        open_wake::NotificationKind::Succeeded
+    );
+    assert_eq!(fs::read_to_string(&attempts).unwrap(), "x");
+    let delivery_error = deliver_hook_notification(state.as_ref(), &first_input, || {
+        Err("simulated broken output pipe".to_owned())
+    })
+    .unwrap_err();
+    assert!(delivery_error.contains("simulated broken output pipe"));
+    assert!(
+        status(state.as_ref(), "thread-delivery-recovery")
+            .unwrap()
+            .unwrap()
+            .pending_notification
+            .is_some()
+    );
+
+    make_hook_owner_stale(
+        state.as_ref(),
+        "thread-delivery-recovery",
+        &armed.id,
+        pending.attempts,
+    );
+    let recovered_input = input_for_turn("thread-delivery-recovery", "recovery-turn");
+    let HookResult::Continue(recovered_reason) =
+        handle_stop_hook(state.as_ref(), &recovered_input).unwrap()
+    else {
+        panic!("expected the pending notification to be retried");
+    };
+    assert_eq!(recovered_reason, first_reason);
+    assert_eq!(fs::read_to_string(&attempts).unwrap(), "x");
+
+    let mut obsolete_output_written = false;
+    assert_eq!(
+        deliver_hook_notification(state.as_ref(), &first_input, || {
+            obsolete_output_written = true;
+            Ok(())
+        })
+        .unwrap(),
+        DeliveryStatus::Superseded
+    );
+    assert!(!obsolete_output_written);
+    assert!(
+        status(state.as_ref(), "thread-delivery-recovery")
+            .unwrap()
+            .unwrap()
+            .pending_notification
+            .is_some()
+    );
+    assert!(acknowledge_hook_delivery(state.as_ref(), &recovered_input).unwrap());
+
+    let delivered = status(state.as_ref(), "thread-delivery-recovery")
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivered.status, ConditionStatus::Succeeded);
+    assert!(delivered.pending_notification.is_none());
+}
+
+#[test]
+fn a_checkpoint_is_retried_before_rearming_the_condition() {
+    let state = TestDir::new();
+    let attempts = state.as_ref().join("checkpoint-attempts");
+    let mut request = request(
+        state.as_ref(),
+        "thread-checkpoint-delivery-recovery",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!("printf x >>'{}'; exit 1", attempts.display()),
+        ],
+    );
+    request.timeout = Duration::from_secs(120);
+    request.checkpoint_every = Some(Duration::from_secs(60));
+    let armed = arm(state.as_ref(), request).unwrap();
+    common::force_checkpoint_now(state.as_ref(), "thread-checkpoint-delivery-recovery");
+
+    let first_input = input_for_turn(
+        "thread-checkpoint-delivery-recovery",
+        "interrupted-checkpoint-turn",
+    );
+    let HookResult::Continue(first_reason) =
+        handle_stop_hook(state.as_ref(), &first_input).unwrap()
+    else {
+        panic!("expected a pending checkpoint");
+    };
+    assert!(first_reason.contains("progress checkpoint 1"));
+    let pending = status(state.as_ref(), "thread-checkpoint-delivery-recovery")
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status, ConditionStatus::Waiting);
+    assert_eq!(pending.attempts, 1);
+
+    make_hook_owner_stale(
+        state.as_ref(),
+        "thread-checkpoint-delivery-recovery",
+        &armed.id,
+        pending.attempts,
+    );
+    let recovered_input = input_for_turn(
+        "thread-checkpoint-delivery-recovery",
+        "recovered-checkpoint-turn",
+    );
+    let HookResult::Continue(recovered_reason) =
+        handle_stop_hook(state.as_ref(), &recovered_input).unwrap()
+    else {
+        panic!("expected the checkpoint to be retried");
+    };
+    assert_eq!(recovered_reason, first_reason);
+    assert_eq!(fs::read_to_string(attempts).unwrap(), "x");
+    assert!(acknowledge_hook_delivery(state.as_ref(), &recovered_input).unwrap());
+
+    let rearmed = status(state.as_ref(), "thread-checkpoint-delivery-recovery")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rearmed.status, ConditionStatus::Armed);
+    assert_eq!(rearmed.checkpoints, 1);
+    assert!(rearmed.pending_notification.is_none());
+    assert!(rearmed.next_checkpoint_at_ms.unwrap() > crate_now_ms());
+}
+
+#[test]
+fn cancellation_supersedes_a_pending_notification_before_output() {
+    let state = TestDir::new();
+    arm(
+        state.as_ref(),
+        request(
+            state.as_ref(),
+            "thread-cancel-delivery",
+            vec!["true".into()],
+        ),
+    )
+    .unwrap();
+    let input = input("thread-cancel-delivery");
+    assert!(matches!(
+        handle_stop_hook(state.as_ref(), &input).unwrap(),
+        HookResult::Continue(_)
+    ));
+    cancel(state.as_ref(), "thread-cancel-delivery").unwrap();
+
+    let mut output_written = false;
+    let delivery = deliver_hook_notification(state.as_ref(), &input, || {
+        output_written = true;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(delivery, DeliveryStatus::Superseded);
+    assert!(!output_written);
+    assert_eq!(
+        status(state.as_ref(), "thread-cancel-delivery")
+            .unwrap()
+            .unwrap()
+            .status,
+        ConditionStatus::Cancelled
+    );
+}
+
+#[test]
 fn version_one_condition_fields_are_read_as_poll_and_checkpoint_fields() {
     let state = TestDir::new();
     let mut version_one = request(state.as_ref(), "thread-v1-state", vec!["true".into()]);
@@ -497,6 +694,30 @@ fn version_one_condition_fields_are_read_as_poll_and_checkpoint_fields() {
     assert_eq!(migrated.id, armed.id);
     assert_eq!(migrated.poll_every_ms, 50);
     assert_eq!(migrated.checkpoint_every_ms, Some(60_000));
+}
+
+#[test]
+fn active_version_two_condition_is_migrated_before_delivery() {
+    let state = TestDir::new();
+    arm(
+        state.as_ref(),
+        request(state.as_ref(), "thread-version-two", vec!["true".into()]),
+    )
+    .unwrap();
+    let path = state.as_ref().join("thread-version-two.json");
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["version"] = 2.into();
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    assert!(matches!(
+        delivered_stop_hook(state.as_ref(), "thread-version-two"),
+        HookResult::Continue(_)
+    ));
+    let migrated = status(state.as_ref(), "thread-version-two")
+        .unwrap()
+        .unwrap();
+    assert_eq!(migrated.version, 3);
+    assert_eq!(migrated.status, ConditionStatus::Succeeded);
 }
 
 #[test]
@@ -549,8 +770,7 @@ fn a_stale_version_one_waiting_record_is_recovered_after_legacy_grace() {
         .unwrap();
     assert_eq!(snapshot.watcher.state, WatcherState::Stale);
     fs::write(&ready, b"").unwrap();
-    let HookResult::Continue(reason) =
-        handle_stop_hook(state.as_ref(), &input("thread-legacy-stale")).unwrap()
+    let HookResult::Continue(reason) = delivered_stop_hook(state.as_ref(), "thread-legacy-stale")
     else {
         panic!("expected stale legacy condition recovery");
     };
@@ -558,7 +778,7 @@ fn a_stale_version_one_waiting_record_is_recovered_after_legacy_grace() {
 }
 
 #[test]
-fn a_rapid_legacy_checkpoint_is_migrated_to_the_v2_minimum() {
+fn a_rapid_legacy_checkpoint_is_migrated_to_the_current_minimum() {
     let state = TestDir::new();
     arm(
         state.as_ref(),
@@ -581,7 +801,7 @@ fn a_rapid_legacy_checkpoint_is_migrated_to_the_v2_minimum() {
     let _ = fs::remove_file(state.as_ref().join(".thread-legacy-checkpoint.owner.json"));
 
     let HookResult::Continue(reason) =
-        handle_stop_hook(state.as_ref(), &input("thread-legacy-checkpoint")).unwrap()
+        delivered_stop_hook(state.as_ref(), "thread-legacy-checkpoint")
     else {
         panic!("expected legacy checkpoint migration to recover");
     };
@@ -590,7 +810,7 @@ fn a_rapid_legacy_checkpoint_is_migrated_to_the_v2_minimum() {
     let migrated = status(state.as_ref(), "thread-legacy-checkpoint")
         .unwrap()
         .unwrap();
-    assert_eq!(migrated.version, 2);
+    assert_eq!(migrated.version, 3);
     assert_eq!(migrated.checkpoint_every_ms, Some(60_000));
     assert!(migrated.next_checkpoint_at_ms.unwrap() > migrated.created_at_ms + 150);
 }
@@ -605,7 +825,7 @@ fn unsupported_condition_versions_fail_closed() {
     .unwrap();
     let path = state.as_ref().join("thread-future-state.json");
     let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    record["version"] = 3.into();
+    record["version"] = 4.into();
     fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
 
     let error = status(state.as_ref(), "thread-future-state").unwrap_err();
@@ -816,6 +1036,34 @@ fn corrupt_condition_is_not_silently_replaced() {
 }
 
 #[test]
+fn inconsistent_pending_checkpoint_is_rejected() {
+    let state = TestDir::new();
+    let armed = arm(
+        state.as_ref(),
+        request(
+            state.as_ref(),
+            "thread-invalid-pending-checkpoint",
+            vec!["true".into()],
+        ),
+    )
+    .unwrap();
+    let record_path = state
+        .as_ref()
+        .join("thread-invalid-pending-checkpoint.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    record["status"] = "waiting".into();
+    record["pending_notification"] = serde_json::json!({
+        "kind": "checkpoint",
+        "created_at_ms": armed.created_at_ms
+    });
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let error = status(state.as_ref(), "thread-invalid-pending-checkpoint").unwrap_err();
+    assert!(error.contains("pending checkpoint requires checkpoint state"));
+}
+
+#[test]
 fn invalid_predicate_wakes_codex_with_the_error() {
     let state = TestDir::new();
     arm(
@@ -828,7 +1076,7 @@ fn invalid_predicate_wakes_codex_with_the_error() {
     )
     .unwrap();
 
-    let result = handle_stop_hook(state.as_ref(), &input("thread-error")).unwrap();
+    let result = delivered_stop_hook(state.as_ref(), "thread-error");
     let HookResult::Continue(reason) = result else {
         panic!("expected error continuation");
     };
@@ -873,7 +1121,7 @@ fn check_timeout_kills_the_entire_predicate_process_group() {
     request.check_timeout = Duration::from_millis(200);
     arm(state.as_ref(), request).unwrap();
 
-    let result = handle_stop_hook(state.as_ref(), &input("thread-process-group")).unwrap();
+    let result = delivered_stop_hook(state.as_ref(), "thread-process-group");
     assert!(matches!(result, HookResult::Continue(_)));
     let condition = status(state.as_ref(), "thread-process-group")
         .unwrap()

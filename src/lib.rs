@@ -3,13 +3,13 @@ use serde_json::{Value, json};
 use std::env;
 use std::ffi::{CString, OsStr};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -53,6 +53,21 @@ pub enum ConditionStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationKind {
+    Checkpoint,
+    Succeeded,
+    TimedOut,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingNotification {
+    pub kind: NotificationKind,
+    pub created_at_ms: u64,
+}
+
 impl ConditionStatus {
     pub fn is_active(&self) -> bool {
         matches!(self, Self::Armed | Self::Waiting)
@@ -89,6 +104,8 @@ pub struct Condition {
     pub last_exit_code: Option<i32>,
     pub last_output: String,
     pub resolved_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_notification: Option<PendingNotification>,
 }
 
 #[derive(Debug)]
@@ -104,6 +121,15 @@ pub struct ArmRequest {
     pub job: Option<JobReference>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HookPhase {
+    Starting,
+    Checking,
+    Sleeping,
+    Delivering,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HookLease {
     version: u8,
@@ -111,6 +137,22 @@ struct HookLease {
     owner_id: String,
     pid: u32,
     heartbeat_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase: Option<HookPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_check_started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_check_completed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_group_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -136,7 +178,49 @@ pub struct WatcherStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heartbeat_age_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<HookPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_check_started_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_check_completed_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_group_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_error: Option<String>,
+}
+
+impl WatcherStatus {
+    fn without_owner(
+        state: WatcherState,
+        condition_id: String,
+        lease_error: Option<String>,
+    ) -> Self {
+        Self {
+            state,
+            condition_id,
+            owner_id: None,
+            pid: None,
+            heartbeat_at_ms: None,
+            heartbeat_age_ms: None,
+            turn_id: None,
+            phase: None,
+            started_at_ms: None,
+            phase_at_ms: None,
+            last_check_started_at_ms: None,
+            last_check_completed_at_ms: None,
+            parent_pid: None,
+            process_group_id: None,
+            lease_error,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -149,6 +233,8 @@ pub struct ConditionSnapshot {
 pub struct StopHookInput {
     pub session_id: String,
     #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
     pub hook_event_name: String,
 }
 
@@ -158,11 +244,83 @@ pub enum HookResult {
     Continue(String),
 }
 
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeliveryStatus {
+    Delivered,
+    Superseded,
+    DeliveredButUnacknowledged(String),
+}
+
 #[derive(Debug)]
 struct CheckResult {
     exit_code: Option<i32>,
     output: String,
     timed_out: bool,
+}
+
+struct PredicateProcessGuard {
+    child: Child,
+    input: Option<ChildStdin>,
+}
+
+impl PredicateProcessGuard {
+    fn spawn() -> Result<Self, String> {
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "active=0; while IFS= read -r value; do active=$value; done; if test \"$active\" -gt 0 2>/dev/null; then kill -KILL -- \"-$active\" 2>/dev/null || :; fi",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|error| format!("start predicate process guard: {error}"))?;
+        let Some(input) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("predicate process guard has no input pipe".to_owned());
+        };
+        let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFD) };
+        if flags == -1
+            || unsafe { libc::fcntl(input.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) }
+                == -1
+        {
+            drop(input);
+            let _ = child.wait();
+            return Err(format!(
+                "protect predicate process guard pipe: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Ok(Self {
+            child,
+            input: Some(input),
+        })
+    }
+
+    fn watch(&mut self, process_group_id: u32) -> Result<(), String> {
+        let input = self
+            .input
+            .as_mut()
+            .ok_or_else(|| "predicate process guard input is closed".to_owned())?;
+        writeln!(input, "{process_group_id}")
+            .and_then(|()| input.flush())
+            .map_err(|error| format!("update predicate process guard: {error}"))
+    }
+
+    fn clear(&mut self) -> Result<(), String> {
+        self.watch(0)
+    }
+}
+
+impl Drop for PredicateProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.clear();
+        self.input.take();
+        let _ = self.child.wait();
+    }
 }
 
 pub fn default_state_dir() -> PathBuf {
@@ -225,7 +383,7 @@ pub fn arm(state_dir: &Path, request: ArmRequest) -> Result<Condition, String> {
     let created_at_ms = now_ms();
     let checkpoint_every_ms = request.checkpoint_every.map(duration_ms);
     let condition = Condition {
-        version: 2,
+        version: 3,
         id: new_condition_id(),
         session_id: request.session_id,
         label: request.label,
@@ -244,6 +402,7 @@ pub fn arm(state_dir: &Path, request: ArmRequest) -> Result<Condition, String> {
         last_exit_code: None,
         last_output: String::new(),
         resolved_at_ms: None,
+        pending_notification: None,
     };
     write_condition(&path, &condition).map_err(io_error("write condition"))?;
     let _ = fs::remove_file(hook_lease_path(
@@ -320,6 +479,7 @@ fn cancel_condition(path: &Path, mut condition: Condition) -> Result<Condition, 
             condition.id, condition.status
         ));
     }
+    condition.pending_notification = None;
     mark_resolved(&mut condition, ConditionStatus::Cancelled);
     write_condition(path, &condition).map_err(io_error("cancel condition"))?;
     let _ = fs::remove_file(hook_lease_path(
@@ -358,9 +518,7 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
             return Ok(HookResult::Noop);
         }
         let owner_id = new_condition_id();
-        migrate_condition_to_v2(&mut condition);
-        condition.status = ConditionStatus::Waiting;
-        write_condition(&path, &condition).map_err(io_error("mark condition waiting"))?;
+        migrate_condition_to_current(&mut condition);
         if let Ok(old_lease) = read_hook_lease(&hook_lease_path(state_dir, &input.session_id)) {
             let _ = fs::remove_file(condition_check_output_path(
                 state_dir,
@@ -368,144 +526,317 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
                 &old_lease.owner_id,
             ));
         }
+        let started_at_ms = now_ms();
         let lease = HookLease {
-            version: 1,
+            version: 2,
             condition_id: condition.id.clone(),
             owner_id: owner_id.clone(),
             pid: std::process::id(),
-            heartbeat_at_ms: now_ms(),
+            heartbeat_at_ms: started_at_ms,
+            turn_id: input.turn_id.clone(),
+            phase: Some(HookPhase::Starting),
+            started_at_ms: Some(started_at_ms),
+            phase_at_ms: Some(started_at_ms),
+            last_check_started_at_ms: None,
+            last_check_completed_at_ms: None,
+            parent_pid: Some(unsafe { libc::getppid() as u32 }),
+            process_group_id: Some(unsafe { libc::getpgrp() }),
         };
         write_hook_lease(&hook_lease_path(state_dir, &input.session_id), &lease)
             .map_err(io_error("acquire hook lease"))?;
+        condition.status = ConditionStatus::Waiting;
+        if let Err(error) = write_condition(&path, &condition) {
+            let _ = fs::remove_file(hook_lease_path(state_dir, &input.session_id));
+            return Err(format!("mark condition waiting: {error}"));
+        }
         (condition, owner_id)
     };
-    let _heartbeat_guard = spawn_hook_heartbeat(
-        state_dir.to_owned(),
-        input.session_id.clone(),
-        condition.id.clone(),
-        owner_id.clone(),
-    );
     let condition_id = condition.id.clone();
+    let outcome = (|| -> Result<HookResult, String> {
+        let _heartbeat_guard = spawn_hook_heartbeat(
+            state_dir.to_owned(),
+            input.session_id.clone(),
+            condition.id.clone(),
+            owner_id.clone(),
+        );
+        let mut predicate_process_guard = PredicateProcessGuard::spawn()?;
 
-    loop {
-        let Some(current) = load_waiting_condition(
-            state_dir,
-            &input.session_id,
-            &condition_id,
-            &owner_id,
-            "refresh condition",
-        )?
-        else {
-            return Ok(HookResult::Noop);
-        };
-        condition = current;
-
-        if now_ms().saturating_sub(condition.created_at_ms) >= condition.timeout_ms {
-            let completed_job = condition
-                .job
-                .as_ref()
-                .and_then(|reference| job::snapshot(&reference.root, &reference.id).ok())
-                .filter(|snapshot| snapshot.is_ready())
-                .map(|snapshot| format!("{}\n", snapshot.summary()));
-            let Some(resolved) = update_waiting_condition(
+        loop {
+            let Some(current) = load_waiting_condition(
                 state_dir,
                 &input.session_id,
                 &condition_id,
                 &owner_id,
-                "resolve condition deadline",
+                "refresh condition",
+            )?
+            else {
+                return Ok(HookResult::Noop);
+            };
+            condition = current;
+
+            if condition.pending_notification.is_some() {
+                if !set_hook_phase(
+                    state_dir,
+                    &input.session_id,
+                    &condition_id,
+                    &owner_id,
+                    HookPhase::Delivering,
+                    false,
+                )? {
+                    return Ok(HookResult::Noop);
+                }
+                return Ok(HookResult::Continue(format_pending_notification(
+                    &condition,
+                )?));
+            }
+
+            if now_ms().saturating_sub(condition.created_at_ms) >= condition.timeout_ms {
+                let completed_job = condition
+                    .job
+                    .as_ref()
+                    .and_then(|reference| job::snapshot(&reference.root, &reference.id).ok())
+                    .filter(|snapshot| snapshot.is_ready())
+                    .map(|snapshot| format!("{}\n", snapshot.summary()));
+                let Some(pending) = update_waiting_condition(
+                    state_dir,
+                    &input.session_id,
+                    &condition_id,
+                    &owner_id,
+                    "resolve condition deadline",
+                    None,
+                    |current| {
+                        if let Some(summary) = &completed_job {
+                            current.attempts += 1;
+                            current.last_exit_code = Some(0);
+                            current.last_output.clone_from(summary);
+                            queue_notification(current, NotificationKind::Succeeded);
+                        } else {
+                            queue_notification(current, NotificationKind::TimedOut);
+                        }
+                    },
+                )?
+                else {
+                    return Ok(HookResult::Noop);
+                };
+                return Ok(HookResult::Continue(format_pending_notification(&pending)?));
+            }
+
+            let remaining = Duration::from_millis(
+                condition
+                    .timeout_ms
+                    .saturating_sub(now_ms().saturating_sub(condition.created_at_ms)),
+            );
+            if !set_hook_phase(
+                state_dir,
+                &input.session_id,
+                &condition_id,
+                &owner_id,
+                HookPhase::Checking,
+                true,
+            )? {
+                return Ok(HookResult::Noop);
+            }
+            let check = match run_check(
+                state_dir,
+                &condition,
+                &owner_id,
+                remaining,
+                &mut predicate_process_guard,
+            ) {
+                Ok(check) => check,
+                Err(error) => {
+                    let Some(failed) = update_waiting_condition(
+                        state_dir,
+                        &input.session_id,
+                        &condition_id,
+                        &owner_id,
+                        "record condition failure",
+                        Some(now_ms()),
+                        |current| {
+                            current.attempts += 1;
+                            current.last_output.clone_from(&error);
+                            queue_notification(current, NotificationKind::Failed);
+                        },
+                    )?
+                    else {
+                        return Ok(HookResult::Noop);
+                    };
+                    return Ok(HookResult::Continue(format_pending_notification(&failed)?));
+                }
+            };
+            let observed_at_ms = now_ms();
+            let Some(updated) = update_waiting_condition(
+                state_dir,
+                &input.session_id,
+                &condition_id,
+                &owner_id,
+                "record condition check",
+                Some(observed_at_ms),
                 |current| {
-                    if let Some(summary) = &completed_job {
-                        current.attempts += 1;
-                        current.last_exit_code = Some(0);
-                        current.last_output.clone_from(summary);
-                        mark_resolved(current, ConditionStatus::Succeeded);
-                    } else {
-                        mark_resolved(current, ConditionStatus::TimedOut);
+                    current.attempts += 1;
+                    current.last_exit_code = check.exit_code;
+                    current.last_output.clone_from(&check.output);
+                    if check.exit_code == Some(0) && !check.timed_out {
+                        queue_notification(current, NotificationKind::Succeeded);
+                    } else if current
+                        .next_checkpoint_at_ms
+                        .is_some_and(|checkpoint_at_ms| observed_at_ms >= checkpoint_at_ms)
+                    {
+                        current.checkpoints += 1;
+                        queue_notification(current, NotificationKind::Checkpoint);
                     }
                 },
             )?
             else {
                 return Ok(HookResult::Noop);
             };
-            return Ok(HookResult::Continue(format_continuation(&resolved)));
-        }
+            condition = updated;
 
-        let remaining = Duration::from_millis(
-            condition
-                .timeout_ms
-                .saturating_sub(now_ms().saturating_sub(condition.created_at_ms)),
-        );
-        let check = match run_check(state_dir, &condition, &owner_id, remaining) {
-            Ok(check) => check,
-            Err(error) => {
-                let Some(failed) = update_waiting_condition(
-                    state_dir,
-                    &input.session_id,
-                    &condition_id,
-                    &owner_id,
-                    "record condition failure",
-                    |current| {
-                        current.attempts += 1;
-                        current.last_output.clone_from(&error);
-                        mark_resolved(current, ConditionStatus::Failed);
-                    },
-                )?
-                else {
-                    return Ok(HookResult::Noop);
-                };
-                return Ok(HookResult::Continue(format_continuation(&failed)));
+            if condition.pending_notification.is_some() {
+                return Ok(HookResult::Continue(format_pending_notification(
+                    &condition,
+                )?));
             }
-        };
-        let observed_at_ms = now_ms();
-        let Some(updated) = update_waiting_condition(
+
+            let remaining_ms = condition
+                .timeout_ms
+                .saturating_sub(now_ms().saturating_sub(condition.created_at_ms));
+            let checkpoint_ms = condition
+                .next_checkpoint_at_ms
+                .map(|checkpoint| checkpoint.saturating_sub(now_ms()))
+                .unwrap_or(u64::MAX);
+            let sleep_for =
+                Duration::from_millis(condition.poll_every_ms.min(remaining_ms).min(checkpoint_ms));
+            if !sleep_for.is_zero() {
+                thread::sleep(sleep_for);
+            }
+        }
+    })();
+
+    match outcome {
+        Ok(result) => Ok(result),
+        Err(error) => recover_owned_hook_failure(
             state_dir,
             &input.session_id,
             &condition_id,
             &owner_id,
-            "record condition check",
-            |current| {
-                current.attempts += 1;
-                current.last_exit_code = check.exit_code;
-                current.last_output.clone_from(&check.output);
-                if check.exit_code == Some(0) && !check.timed_out {
-                    mark_resolved(current, ConditionStatus::Succeeded);
-                } else if current
-                    .next_checkpoint_at_ms
-                    .is_some_and(|checkpoint_at_ms| observed_at_ms >= checkpoint_at_ms)
-                {
-                    current.status = ConditionStatus::Armed;
-                    current.checkpoints += 1;
-                    current.next_checkpoint_at_ms = current
-                        .checkpoint_every_ms
-                        .map(|interval| observed_at_ms.saturating_add(interval));
-                }
-            },
-        )?
-        else {
-            return Ok(HookResult::Noop);
-        };
-        condition = updated;
+            error,
+        ),
+    }
+}
 
-        if condition.status == ConditionStatus::Succeeded {
-            return Ok(HookResult::Continue(format_continuation(&condition)));
-        }
-        if condition.status == ConditionStatus::Armed {
-            return Ok(HookResult::Continue(format_checkpoint(&condition)));
-        }
+fn recover_owned_hook_failure(
+    state_dir: &Path,
+    session_id: &str,
+    condition_id: &str,
+    owner_id: &str,
+    error: String,
+) -> Result<HookResult, String> {
+    let recovery = update_waiting_condition(
+        state_dir,
+        session_id,
+        condition_id,
+        owner_id,
+        "record internal hook failure",
+        None,
+        |current| {
+            current.last_exit_code = None;
+            current.last_output = format!("open-wake hook failed internally: {error}");
+            queue_notification(current, NotificationKind::Failed);
+        },
+    );
+    match recovery {
+        Ok(Some(condition)) => Ok(HookResult::Continue(format_pending_notification(
+            &condition,
+        )?)),
+        Ok(None) => Ok(HookResult::Noop),
+        Err(recovery_error) => Err(format!(
+            "{error}; additionally failed to record the hook failure: {recovery_error}"
+        )),
+    }
+}
 
-        let remaining_ms = condition
-            .timeout_ms
-            .saturating_sub(now_ms().saturating_sub(condition.created_at_ms));
-        let checkpoint_ms = condition
-            .next_checkpoint_at_ms
-            .map(|checkpoint| checkpoint.saturating_sub(now_ms()))
-            .unwrap_or(u64::MAX);
-        let sleep_for =
-            Duration::from_millis(condition.poll_every_ms.min(remaining_ms).min(checkpoint_ms));
-        if !sleep_for.is_zero() {
-            thread::sleep(sleep_for);
+#[doc(hidden)]
+pub fn acknowledge_hook_delivery(state_dir: &Path, input: &StopHookInput) -> Result<bool, String> {
+    match deliver_hook_notification(state_dir, input, || Ok(()))? {
+        DeliveryStatus::Delivered => Ok(true),
+        DeliveryStatus::Superseded => Ok(false),
+        DeliveryStatus::DeliveredButUnacknowledged(error) => Err(error),
+    }
+}
+
+#[doc(hidden)]
+pub fn deliver_hook_notification(
+    state_dir: &Path,
+    input: &StopHookInput,
+    deliver: impl FnOnce() -> Result<(), String>,
+) -> Result<DeliveryStatus, String> {
+    if input.hook_event_name != "Stop" {
+        return Ok(DeliveryStatus::Superseded);
+    }
+    let _lock = lock_condition(state_dir, &input.session_id)?;
+    let path = condition_path(state_dir, &input.session_id);
+    let mut condition = match read_condition(&path) {
+        Ok(condition) => condition,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DeliveryStatus::Superseded);
+        }
+        Err(error) => return Err(format!("read delivered condition: {error}")),
+    };
+    if condition.status != ConditionStatus::Waiting {
+        return Ok(DeliveryStatus::Superseded);
+    }
+    let Some(notification) = condition.pending_notification.clone() else {
+        return Ok(DeliveryStatus::Superseded);
+    };
+    let lease = read_hook_lease(&hook_lease_path(state_dir, &input.session_id))
+        .map_err(io_error("read delivered hook lease"))?;
+    if lease.condition_id != condition.id
+        || lease.pid != std::process::id()
+        || lease.turn_id != input.turn_id
+    {
+        return Ok(DeliveryStatus::Superseded);
+    }
+
+    deliver()?;
+    condition.pending_notification = None;
+
+    match notification.kind {
+        NotificationKind::Checkpoint => {
+            condition.status = ConditionStatus::Armed;
+            condition.next_checkpoint_at_ms = condition
+                .checkpoint_every_ms
+                .map(|interval| now_ms().saturating_add(interval));
+        }
+        NotificationKind::Succeeded => {
+            mark_resolved_at(
+                &mut condition,
+                ConditionStatus::Succeeded,
+                notification.created_at_ms,
+            );
+        }
+        NotificationKind::TimedOut => {
+            mark_resolved_at(
+                &mut condition,
+                ConditionStatus::TimedOut,
+                notification.created_at_ms,
+            );
+        }
+        NotificationKind::Failed => {
+            mark_resolved_at(
+                &mut condition,
+                ConditionStatus::Failed,
+                notification.created_at_ms,
+            );
         }
     }
+    if let Err(error) = write_condition(&path, &condition) {
+        return Ok(DeliveryStatus::DeliveredButUnacknowledged(format!(
+            "acknowledge hook delivery: {error}"
+        )));
+    }
+    let _ = fs::remove_file(hook_lease_path(state_dir, &input.session_id));
+    Ok(DeliveryStatus::Delivered)
 }
 
 pub fn hook_output(result: HookResult) -> Value {
@@ -564,9 +895,10 @@ fn run_check(
     condition: &Condition,
     owner_id: &str,
     remaining: Duration,
+    process_guard: &mut PredicateProcessGuard,
 ) -> Result<CheckResult, String> {
     let output_path = condition_check_output_path(state_dir, condition, owner_id);
-    let result = run_check_with_output(condition, remaining, &output_path);
+    let result = run_check_with_output(condition, remaining, &output_path, process_guard);
     let _ = fs::remove_file(output_path);
     result
 }
@@ -575,6 +907,7 @@ fn run_check_with_output(
     condition: &Condition,
     remaining: Duration,
     output_path: &Path,
+    process_guard: &mut PredicateProcessGuard,
 ) -> Result<CheckResult, String> {
     let output = open_private_truncate(output_path).map_err(io_error("open check output"))?;
     let error_output = output.try_clone().map_err(io_error("clone check output"))?;
@@ -587,12 +920,22 @@ fn run_check_with_output(
         .process_group(0)
         .spawn()
         .map_err(|error| format!("start predicate {:?}: {error}", condition.command))?;
+    if let Err(error) = process_guard.watch(child.id()) {
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.wait();
+        return Err(error);
+    }
 
     let started = std::time::Instant::now();
     let check_timeout = Duration::from_millis(condition.check_timeout_ms).min(remaining);
     let (exit_code, timed_out) = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break (status.code(), false),
+            Ok(Some(status)) => {
+                process_guard.clear()?;
+                break (status.code(), false);
+            }
             Ok(None) if started.elapsed() < check_timeout => {
                 thread::sleep(MIN_POLL_INTERVAL);
             }
@@ -604,9 +947,17 @@ fn run_check_with_output(
                 }
                 let _ = child.kill();
                 let status = child.wait().map_err(io_error("reap timed-out predicate"))?;
+                process_guard.clear()?;
                 break (status.code(), true);
             }
-            Err(error) => return Err(format!("wait for predicate: {error}")),
+            Err(error) => {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.wait();
+                process_guard.clear()?;
+                return Err(format!("wait for predicate: {error}"));
+            }
         }
     };
 
@@ -619,11 +970,26 @@ fn run_check_with_output(
 }
 
 fn mark_resolved(condition: &mut Condition, status: ConditionStatus) {
-    condition.status = status;
-    condition.resolved_at_ms = Some(now_ms());
+    mark_resolved_at(condition, status, now_ms());
 }
 
-fn migrate_condition_to_v2(condition: &mut Condition) {
+fn mark_resolved_at(condition: &mut Condition, status: ConditionStatus, resolved_at_ms: u64) {
+    condition.status = status;
+    condition.resolved_at_ms = Some(resolved_at_ms);
+}
+
+fn queue_notification(condition: &mut Condition, kind: NotificationKind) {
+    condition.pending_notification = Some(PendingNotification {
+        kind,
+        created_at_ms: now_ms(),
+    });
+}
+
+fn migrate_condition_to_current(condition: &mut Condition) {
+    if condition.version != 1 {
+        condition.version = 3;
+        return;
+    }
     let observed_at_ms = now_ms();
     let remaining_timeout_ms = condition
         .timeout_ms
@@ -634,7 +1000,7 @@ fn migrate_condition_to_v2(condition: &mut Condition) {
     let migrated_checkpoint_every_ms =
         migrated_checkpoint_every_ms.filter(|interval_ms| *interval_ms < remaining_timeout_ms);
 
-    condition.version = 2;
+    condition.version = 3;
     let preserve_next_checkpoint = legacy_checkpoint_every_ms.is_some()
         && legacy_checkpoint_every_ms == migrated_checkpoint_every_ms
         && condition.next_checkpoint_at_ms.is_some();
@@ -643,6 +1009,26 @@ fn migrate_condition_to_v2(condition: &mut Condition) {
         condition.next_checkpoint_at_ms = migrated_checkpoint_every_ms
             .map(|interval_ms| observed_at_ms.saturating_add(interval_ms));
     }
+}
+
+fn format_pending_notification(condition: &Condition) -> Result<String, String> {
+    let notification = condition
+        .pending_notification
+        .as_ref()
+        .ok_or_else(|| "condition has no pending notification".to_owned())?;
+    if notification.kind == NotificationKind::Checkpoint {
+        return Ok(format_checkpoint(condition, notification.created_at_ms));
+    }
+
+    let mut rendered = condition.clone();
+    rendered.status = match notification.kind {
+        NotificationKind::Succeeded => ConditionStatus::Succeeded,
+        NotificationKind::TimedOut => ConditionStatus::TimedOut,
+        NotificationKind::Failed => ConditionStatus::Failed,
+        NotificationKind::Checkpoint => unreachable!(),
+    };
+    rendered.resolved_at_ms = Some(notification.created_at_ms);
+    Ok(format_continuation(&rendered))
 }
 
 fn format_continuation(condition: &Condition) -> String {
@@ -680,13 +1066,13 @@ fn format_continuation(condition: &Condition) -> String {
     message
 }
 
-fn format_checkpoint(condition: &Condition) -> String {
+fn format_checkpoint(condition: &Condition, checkpoint_at_ms: u64) -> String {
     let label = condition_label(condition);
     let mut message = format!(
         "open-wake: progress checkpoint {} for `{label}` after {} ({} checks). The same condition remains armed; inspect progress now, then finish the turn to keep waiting or run `open-wake cancel` to stop future wake-ups.",
         condition.checkpoints,
         humantime::format_duration(Duration::from_millis(
-            now_ms().saturating_sub(condition.created_at_ms)
+            checkpoint_at_ms.saturating_sub(condition.created_at_ms)
         )),
         condition.attempts,
     );
@@ -749,26 +1135,10 @@ fn watcher_status(
     observed_at_ms: u64,
 ) -> WatcherStatus {
     if condition.status == ConditionStatus::Armed {
-        return WatcherStatus {
-            state: WatcherState::Armed,
-            condition_id: condition.id.clone(),
-            owner_id: None,
-            pid: None,
-            heartbeat_at_ms: None,
-            heartbeat_age_ms: None,
-            lease_error: None,
-        };
+        return WatcherStatus::without_owner(WatcherState::Armed, condition.id.clone(), None);
     }
     if !condition.status.is_active() {
-        return WatcherStatus {
-            state: WatcherState::Inactive,
-            condition_id: condition.id.clone(),
-            owner_id: None,
-            pid: None,
-            heartbeat_at_ms: None,
-            heartbeat_age_ms: None,
-            lease_error: None,
-        };
+        return WatcherStatus::without_owner(WatcherState::Inactive, condition.id.clone(), None);
     }
 
     let lease_path = hook_lease_path(
@@ -803,35 +1173,35 @@ fn watcher_status(
                 pid: Some(lease.pid),
                 heartbeat_at_ms: Some(lease.heartbeat_at_ms),
                 heartbeat_age_ms: Some(heartbeat_age_ms),
+                turn_id: lease.turn_id,
+                phase: lease.phase,
+                started_at_ms: lease.started_at_ms,
+                phase_at_ms: lease.phase_at_ms,
+                last_check_started_at_ms: lease.last_check_started_at_ms,
+                last_check_completed_at_ms: lease.last_check_completed_at_ms,
+                parent_pid: lease.parent_pid,
+                process_group_id: lease.process_group_id,
                 lease_error,
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let legacy_recent = condition.version == 1
                 && !legacy_condition_is_stale(condition_path, condition, observed_at_ms);
-            WatcherStatus {
-                state: if legacy_recent {
+            WatcherStatus::without_owner(
+                if legacy_recent {
                     WatcherState::LegacyUnknown
                 } else {
                     WatcherState::Stale
                 },
-                condition_id: condition.id.clone(),
-                owner_id: None,
-                pid: None,
-                heartbeat_at_ms: None,
-                heartbeat_age_ms: None,
-                lease_error: None,
-            }
+                condition.id.clone(),
+                None,
+            )
         }
-        Err(error) => WatcherStatus {
-            state: WatcherState::Stale,
-            condition_id: condition.id.clone(),
-            owner_id: None,
-            pid: None,
-            heartbeat_at_ms: None,
-            heartbeat_age_ms: None,
-            lease_error: Some(error.to_string()),
-        },
+        Err(error) => WatcherStatus::without_owner(
+            WatcherState::Stale,
+            condition.id.clone(),
+            Some(error.to_string()),
+        ),
     }
 }
 
@@ -930,6 +1300,7 @@ fn update_waiting_condition(
     expected_id: &str,
     expected_owner_id: &str,
     context: &'static str,
+    check_completed_at_ms: Option<u64>,
     update: impl FnOnce(&mut Condition),
 ) -> Result<Option<Condition>, String> {
     let _lock = lock_condition(state_dir, session_id)?;
@@ -944,13 +1315,52 @@ fn update_waiting_condition(
     update(&mut condition);
     write_condition(&path, &condition).map_err(|error| format!("{context}: {error}"))?;
     if condition.status.is_active() {
-        lease.heartbeat_at_ms = now_ms();
-        write_hook_lease(&hook_lease_path(state_dir, session_id), &lease)
-            .map_err(|error| format!("{context}: refresh hook lease: {error}"))?;
+        let observed_at_ms = now_ms();
+        lease.heartbeat_at_ms = observed_at_ms;
+        if let Some(completed_at_ms) = check_completed_at_ms {
+            lease.last_check_completed_at_ms = Some(completed_at_ms);
+        }
+        lease.phase = Some(if condition.pending_notification.is_some() {
+            HookPhase::Delivering
+        } else {
+            HookPhase::Sleeping
+        });
+        lease.phase_at_ms = Some(observed_at_ms);
+        if let Err(error) = write_hook_lease(&hook_lease_path(state_dir, session_id), &lease)
+            && condition.pending_notification.is_none()
+        {
+            return Err(format!("{context}: refresh hook lease: {error}"));
+        }
     } else {
         let _ = fs::remove_file(hook_lease_path(state_dir, session_id));
     }
     Ok(Some(condition))
+}
+
+fn set_hook_phase(
+    state_dir: &Path,
+    session_id: &str,
+    expected_id: &str,
+    expected_owner_id: &str,
+    phase: HookPhase,
+    starts_check: bool,
+) -> Result<bool, String> {
+    let _lock = lock_condition(state_dir, session_id)?;
+    let path = condition_path(state_dir, session_id);
+    if read_waiting_condition(&path, expected_id, expected_owner_id, "set hook phase")?.is_none() {
+        return Ok(false);
+    }
+    let lease_path = hook_lease_path(state_dir, session_id);
+    let mut lease = read_hook_lease(&lease_path).map_err(io_error("read hook phase lease"))?;
+    let observed_at_ms = now_ms();
+    lease.phase = Some(phase);
+    lease.phase_at_ms = Some(observed_at_ms);
+    lease.heartbeat_at_ms = observed_at_ms;
+    if starts_check {
+        lease.last_check_started_at_ms = Some(observed_at_ms);
+    }
+    write_hook_lease(&lease_path, &lease).map_err(io_error("write hook phase lease"))?;
+    Ok(true)
 }
 
 fn hook_lease_is_owned(
@@ -979,13 +1389,22 @@ fn write_hook_lease(path: &Path, lease: &HookLease) -> io::Result<()> {
 }
 
 fn validate_hook_lease(lease: &HookLease) -> io::Result<()> {
-    if lease.version != 1
+    if !matches!(lease.version, 1 | 2)
         || lease.pid == 0
         || lease.pid > i32::MAX as u32
         || lease.condition_id.is_empty()
         || lease.owner_id.is_empty()
     {
         return Err(io::Error::other("invalid hook owner lease"));
+    }
+    if lease.version == 2
+        && (lease.phase.is_none()
+            || lease.started_at_ms.is_none()
+            || lease.phase_at_ms.is_none()
+            || lease.parent_pid.is_none()
+            || lease.process_group_id.is_none())
+    {
+        return Err(io::Error::other("incomplete hook owner diagnostics"));
     }
     Ok(())
 }
@@ -1079,7 +1498,7 @@ fn write_condition(path: &Path, condition: &Condition) -> io::Result<()> {
 }
 
 fn validate_condition(condition: &Condition) -> io::Result<()> {
-    if !matches!(condition.version, 1 | 2) {
+    if !matches!(condition.version, 1..=3) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported condition version {}", condition.version),
@@ -1098,19 +1517,19 @@ fn validate_condition(condition: &Condition) -> io::Result<()> {
             "condition check timeout must be greater than zero",
         ));
     }
-    if condition.version == 2
+    if condition.version >= 2
         && let Some(checkpoint_every_ms) = condition.checkpoint_every_ms
         && (checkpoint_every_ms < duration_ms(MIN_CHECKPOINT_INTERVAL)
             || checkpoint_every_ms >= condition.timeout_ms)
     {
         return Err(io::Error::other("invalid condition checkpoint interval"));
     }
-    if condition.version == 2
+    if condition.version >= 2
         && condition.checkpoint_every_ms.is_some() != condition.next_checkpoint_at_ms.is_some()
     {
         return Err(io::Error::other("inconsistent condition checkpoint state"));
     }
-    if condition.version == 2
+    if condition.version >= 2
         && condition
             .next_checkpoint_at_ms
             .is_some_and(|checkpoint_at_ms| {
@@ -1119,6 +1538,28 @@ fn validate_condition(condition: &Condition) -> io::Result<()> {
     {
         return Err(io::Error::other(
             "condition checkpoint is after its deadline",
+        ));
+    }
+    if condition.version < 3 && condition.pending_notification.is_some() {
+        return Err(io::Error::other(
+            "legacy condition has a pending notification",
+        ));
+    }
+    if condition.pending_notification.is_some() && condition.status != ConditionStatus::Waiting {
+        return Err(io::Error::other(
+            "pending notification requires a waiting condition",
+        ));
+    }
+    if condition
+        .pending_notification
+        .as_ref()
+        .is_some_and(|notification| {
+            notification.kind == NotificationKind::Checkpoint
+                && (condition.checkpoint_every_ms.is_none() || condition.checkpoints == 0)
+        })
+    {
+        return Err(io::Error::other(
+            "pending checkpoint requires checkpoint state",
         ));
     }
     Ok(())

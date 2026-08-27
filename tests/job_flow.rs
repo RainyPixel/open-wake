@@ -57,7 +57,7 @@ fn spawn_stop_hook(state: &Path, session: &str) -> Child {
         .unwrap();
     writeln!(
         child.stdin.take().unwrap(),
-        "{{\"session_id\":\"{session}\",\"hook_event_name\":\"Stop\"}}"
+        "{{\"session_id\":\"{session}\",\"turn_id\":\"test-turn\",\"hook_event_name\":\"Stop\"}}"
     )
     .unwrap();
     child
@@ -523,6 +523,90 @@ fn hook_heartbeats_keep_a_live_lease_authoritative() {
         .unwrap();
     let output = hook.wait_with_output().unwrap();
     assert_eq!(successful_json(output), json!({}));
+}
+
+#[test]
+fn an_abrupt_hook_exit_records_its_phase_and_reaps_the_predicate() {
+    let workspace = TestDir::new();
+    let state = workspace.as_ref().join("state");
+    let predicate_pid_path = workspace.as_ref().join("predicate-pid");
+    let predicate = format!(
+        "printf '%s\n' $$ >'{}'; sleep 60",
+        predicate_pid_path.display()
+    );
+    let armed = Command::new(binary())
+        .args(["arm", "--thread", "abrupt-hook", "--state-dir"])
+        .arg(&state)
+        .args([
+            "--timeout",
+            "2m",
+            "--poll-every",
+            "50ms",
+            "--check-timeout",
+            "1m",
+            "--",
+            "sh",
+            "-c",
+            &predicate,
+        ])
+        .output()
+        .unwrap();
+    assert_success(&armed);
+
+    let mut hook = spawn_stop_hook(&state, "abrupt-hook");
+    wait_for_file(&predicate_pid_path);
+    let live = status_json(&state, "abrupt-hook")["watcher"].clone();
+    assert_eq!(live["state"], "alive");
+    assert_eq!(live["phase"], "checking");
+    assert_eq!(live["turn_id"], "test-turn");
+    assert!(live["started_at_ms"].is_u64());
+    assert!(live["phase_at_ms"].is_u64());
+    assert!(live["last_check_started_at_ms"].is_u64());
+    assert!(live["parent_pid"].is_u64());
+    assert!(live["process_group_id"].is_i64());
+
+    hook.kill().unwrap();
+    let killed = hook.wait().unwrap();
+    assert!(!killed.success());
+
+    let predicate_pid = fs::read_to_string(&predicate_pid_path)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    let reaped_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if unsafe { libc::kill(predicate_pid, 0) } == -1 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < reaped_deadline,
+            "predicate survived its hook process"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let stale = status_json(&state, "abrupt-hook")["watcher"].clone();
+    assert_eq!(stale["state"], "stale");
+    assert_eq!(stale["phase"], "checking");
+    assert_eq!(stale["turn_id"], "test-turn");
+    assert!(
+        stale["lease_error"]
+            .as_str()
+            .unwrap()
+            .contains("no longer exists")
+    );
+
+    let cancelled = Command::new(binary())
+        .args(["cancel", "--thread", "abrupt-hook", "--state-dir"])
+        .arg(&state)
+        .output()
+        .unwrap();
+    assert_success(&cancelled);
 }
 
 #[test]

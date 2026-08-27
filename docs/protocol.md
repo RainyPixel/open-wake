@@ -19,19 +19,25 @@ state or a configured checkpoint is reached:
 | `cancelled` | User requested cancellation | No |
 
 A recurring checkpoint produces a continuation but is not terminal. The
-condition records the checkpoint, transitions back to `armed`, and keeps its
+condition records the checkpoint and a pending notification while it remains
+`waiting`. After the response is written and flushed to Codex, the hook
+acknowledges delivery, transitions the condition back to `armed`, and keeps its
 original deadline. When that agent turn stops, the next hook invocation resumes
 checking the same predicate. For `run`, the detached command is never launched
 again.
 
 A `waiting` record is not by itself proof that a hook is alive. Its lease
 contains the condition ID, unique owner ID, PID, and heartbeat
-time. The owning hook refreshes the heartbeat while waiting. Liveness requires a
+time. Version-2 leases also record the Codex turn ID, current phase, phase and
+check timestamps, parent PID, and process group. The owning hook refreshes the
+heartbeat while waiting. Liveness requires a
 recent heartbeat and an existing owner PID; PID liveness is checked without
 delivering a signal. The current writer refreshes every second and treats a
 heartbeat older than five seconds as stale. If Codex interrupts the process, a
 later Stop invocation may acquire the stale lease and continue the same
 condition without resetting its ID, attempts, deadline, or checkpoint count.
+An explicit operator `turn_aborted` is an expected source of this recovery
+path, not a predicate or open-wake failure.
 Until a legacy version-1 record can be classified safely, a recent record
 without a lease is treated as ownership-unknown.
 
@@ -51,8 +57,13 @@ The continuation is the standard Stop-hook response:
 ```
 
 The `block` decision prevents the current stop and creates one new agent turn.
-A terminal record is inactive, so a later `Stop` event returns `{}` rather than
-creating another continuation.
+Before that response is emitted, the result is stored as a pending notification
+without making the condition terminal. A successful stdout write and flush is
+the delivery acknowledgement that commits `succeeded`, `timed_out`, `failed`,
+or the checkpoint's return to `armed`. If the hook dies before delivery, a
+later Stop invocation returns the same pending notification without running the
+predicate again. A delivered terminal record is inactive, so a later `Stop`
+event returns `{}` rather than creating another continuation.
 
 ## Ownership
 
@@ -63,16 +74,20 @@ Every read-validate-write transition is serialized by a per-session lock. Only
 one fresh hook lease may drive a `waiting` generation. Hook updates require the
 condition ID and owner ID they started with; predicate output is
 condition- and owner-scoped, so overlapping predicates from a stale hook and
-recovery hook cannot remove or overwrite each other's temporary output.
+recovery hook cannot remove or overwrite each other's temporary output. A
+delivery acknowledgement additionally has to match the lease's hook PID and
+Codex turn ID, so an obsolete turn cannot commit a recovered notification.
 
-New condition records are version 2 and use `poll_every_ms` plus
-`checkpoint_every_ms`. The reader also accepts version-1 `interval_ms` and
-`check_every_ms` fields so an already active condition remains observable after
-an upgrade. On takeover, a legacy checkpoint below one minute is raised to one
-minute, or removed when the remaining overall timeout cannot accommodate it.
-New writes do not preserve the old field names. A binary older than this state
-format cannot read version-2 records, so downgrade after a v2 write requires
-discarding or manually migrating that ephemeral condition.
+New condition records are version 3 and use `poll_every_ms`,
+`checkpoint_every_ms`, and an optional two-phase `pending_notification`. The
+reader also accepts version-1 `interval_ms`/`check_every_ms` records and
+version-2 records without pending delivery so an already active condition
+remains observable after an upgrade. On takeover, a version-1 checkpoint below
+one minute is raised to one minute, or removed when the remaining overall
+timeout cannot accommodate it. New writes do not preserve the old field names.
+A binary older than this state format cannot read version-3 records, so
+downgrade after a v3 write requires discarding or manually migrating that
+ephemeral condition.
 
 For `run`, a persistent job directory contains `job.json`, a heartbeat,
 `output.log`, and eventually an atomic `result.json`. The result records the
@@ -104,6 +119,8 @@ shorter than the timeout; values below five minutes produce a warning.
 - A missing or inactive condition is a no-op.
 - A `waiting` condition with a fresh lease is ignored by another hook. A stale
   lease is recoverable by the next Stop invocation.
+- A prepared continuation remains pending until its JSON response is written
+  and flushed. Stale takeover retries pending evidence without another check.
 - Predicate exit statuses other than `0` mean "not ready" and are retried.
 - Failure to start or observe a predicate wakes Codex with `failed` evidence.
 - Failure to acknowledge a `run` supervisor cancels its newly armed condition
@@ -122,6 +139,13 @@ shorter than the timeout; values below five minutes produce a warning.
   stop without acting on the new record.
 - Predicate stdout and stderr share one private file; only the last 4 KiB can be
   copied into the continuation.
+- An active predicate is watched by a process in a separate group. Death of the
+  hook process alone closes its private control pipe, causing a surviving guard
+  to kill the predicate group instead of leaking it. A host-wide process-tree
+  or cgroup kill can also terminate the guard and is outside this fallback.
+- If the Codex host kills a hook before any notification is prepared, only a
+  later Stop invocation can recover the wait; the adapter has no supported API
+  for starting a model turn after Codex has completed the original turn.
 - Supervised command stdout and stderr share a persistent, unrestricted disk
   log. `logs` returns only its absolute path so callers can use native bounded
   readers and search tools.

@@ -14,6 +14,8 @@ research.
 - Optional recurring checkpoints that keep the same condition and job active.
 - Recoverable hook-owner leases for interrupted `waiting` conditions, explicit
   local `--poll-every` semantics, and rate-limited model-visible checkpoints.
+- Two-phase continuation delivery, phase/turn/process diagnostics for abrupt
+  hook exits, and predicate-group cleanup when the hook host disappears.
 - Success, timeout, failure, replacement, and cancellation outcomes.
 - Per-project or per-user setup, read-only doctor checks including missed or
   expired conditions, stale job heartbeats, and writable state roots,
@@ -58,7 +60,8 @@ instead of guessed abstractions.
 - Add explicit job retention and garbage collection with age/size previews;
   never silently delete logs. Consider optional log rotation or a disk budget.
 - Add a machine-readable event schema for arm, check, wake, timeout, and cancel
-  outcomes while keeping model-visible output bounded.
+  outcomes beyond the current condition and watcher snapshots while keeping
+  model-visible output bounded.
 - Add adaptive checkpoints based on log/activity changes after fixed periodic
   checkpoints have real-world usage evidence.
 - Add shell completions and man pages after the command surface stabilizes.
@@ -82,8 +85,9 @@ instead of guessed abstractions.
 - Run end-to-end tests against a supported-version matrix of each real agent,
   not only protocol fixtures or mocked hook input.
 - Add fault-injection coverage for killed supervisors, corrupted state,
-  disappearing working directories, predicate process leaks, interrupted
-  updates, and unavailable release services.
+  disappearing working directories, interrupted updates, and unavailable
+  release services. Abrupt hook exit, pending-delivery recovery, and predicate
+  process cleanup already have executable coverage.
 - Verify release installation and self-update from the public artifacts on
   every supported OS and architecture.
 

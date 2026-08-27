@@ -242,6 +242,10 @@ open-wake uninstall --scope project
 `status` always reports the condition and watcher-lease health when its record
 is readable. If an attached job record is missing or corrupt, JSON output
 includes `job_error` instead of hiding the condition behind a command failure.
+For a live or interrupted hook, `watcher` also reports the Codex turn ID, hook
+phase, phase/check timestamps, parent PID, and process group. A stale watcher in
+phase `checking` means the hook disappeared while a predicate was in flight;
+phase `delivering` means a continuation had already been durably prepared.
 
 One condition can be active per Codex session. Ephemeral condition state uses
 `$XDG_RUNTIME_DIR/open-wake` when that location is writable. In a restricted
@@ -252,8 +256,12 @@ condition generation ID, and a hook-owner lease with a heartbeat. Only one
 fresh hook lease may drive a generation; if Codex interrupts that hook, the
 next Stop invocation can recover the same `waiting` condition after its lease
 becomes stale. An old hook or failed launcher cannot overwrite, cancel, or
-share predicate output with a replacement condition. Legacy `cancel_requested`
-records are terminal and an idempotent `cancel` normalizes them to `cancelled`.
+share predicate output with a replacement condition. Continuations use a
+two-phase delivery record: success, timeout, failure, and checkpoint evidence
+remain pending until the hook response has been written and flushed to Codex.
+If the hook disappears first, the next Stop invocation retries the same bounded
+continuation without rerunning the predicate. Legacy `cancel_requested` records
+are terminal and an idempotent `cancel` normalizes them to `cancelled`.
 
 Supervised job records and full logs persist under
 `$XDG_STATE_HOME/open-wake/jobs` or `~/.local/state/open-wake/jobs` when the
@@ -275,7 +283,17 @@ The `Stop` hook may invoke a predicate many times with the agent's local user
 permissions. Never put credentials in predicate arguments or output, and never
 use a predicate that mutates production, retries an action, or performs cleanup.
 Each predicate runs in its own process group; a per-check timeout kills the
-whole group to avoid leaked descendants.
+whole group to avoid leaked descendants. A short-lived guard in a separate
+process group also kills the active predicate group if the hook process alone
+terminates abruptly and the guard remains alive. Host-wide process-tree or
+cgroup termination is outside this fallback's control.
+
+Codex owns the synchronous Stop-hook process and the only supported way to
+start another model turn. If Codex terminates that process while it is still
+checking, `open-wake` can retain diagnostics, reap the predicate, and recover
+on a later Stop invocation, but it cannot manufacture a continuation after the
+host has already completed the turn. This host lifecycle boundary is distinct
+from recoverable pre-delivery interruption after a result has been prepared.
 
 Condition and job directories are private (`0700`) and their records/logs are
 `0600`. The on-disk job log is complete and currently has no automatic size

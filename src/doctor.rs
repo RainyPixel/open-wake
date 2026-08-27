@@ -209,7 +209,7 @@ fn inspect_active_condition(
         condition.status == ConditionStatus::Waiting && watcher.state == WatcherState::Stale;
     let legacy_watcher = condition.status == ConditionStatus::Waiting
         && watcher.state == WatcherState::LegacyUnknown;
-    let unhealthy = expired || unobserved_ready_job || job_error.is_some() || stale_watcher;
+    let hard_failure = expired || unobserved_ready_job || job_error.is_some();
     let fix = if job_error.is_some() {
         Some(
             "inspect the recorded job root, log, and process authority before cancelling; do not launch a replacement while the command outcome is unknown"
@@ -220,7 +220,7 @@ fn inspect_active_condition(
             "finish the current Codex turn so the next Stop hook can recover this condition; run `open-wake cancel` only to abandon notifications"
                 .to_owned(),
         )
-    } else if unhealthy {
+    } else if hard_failure {
         Some(
             "run `open-wake cancel` to release this session, then open `/hooks`, verify and trust the exact command, and restart Codex before arming another condition"
                 .to_owned(),
@@ -231,9 +231,9 @@ fn inspect_active_condition(
 
     report.push(DoctorCheck {
         name: "active_condition".to_owned(),
-        status: if unhealthy {
+        status: if hard_failure {
             CheckStatus::Fail
-        } else if legacy_watcher {
+        } else if stale_watcher || legacy_watcher {
             CheckStatus::Warn
         } else {
             CheckStatus::Pass
@@ -255,13 +255,32 @@ fn inspect_active_condition(
             )
         } else if expired {
             format!(
-                "condition {} remains {:?} after its deadline ({} attempts; watcher {:?})",
-                condition.id, condition.status, condition.attempts, watcher.state
+                "condition {} remains {:?} after its deadline ({} attempts; watcher {:?}; phase {:?}; turn {:?})",
+                condition.id,
+                condition.status,
+                condition.attempts,
+                watcher.state,
+                watcher.phase,
+                watcher.turn_id
+            )
+        } else if stale_watcher {
+            format!(
+                "condition {} is {:?} with watcher Stale after an interrupted or explicitly aborted hook ({} attempts; phase {:?}; turn {:?})",
+                condition.id,
+                condition.status,
+                condition.attempts,
+                watcher.phase,
+                watcher.turn_id
             )
         } else {
             format!(
-                "condition {} is {:?} with watcher {:?} ({} attempts)",
-                condition.id, condition.status, watcher.state, condition.attempts
+                "condition {} is {:?} with watcher {:?} ({} attempts; phase {:?}; turn {:?})",
+                condition.id,
+                condition.status,
+                watcher.state,
+                condition.attempts,
+                watcher.phase,
+                watcher.turn_id
             )
         },
         fix,
@@ -575,15 +594,17 @@ fn protocol_smoke_test() -> Result<(), String> {
             job: None,
         },
     )?;
-    let result = handle_stop_hook(
-        directory.as_ref(),
-        &StopHookInput {
-            session_id: session_id.clone(),
-            hook_event_name: "Stop".to_owned(),
-        },
-    )?;
+    let hook_input = StopHookInput {
+        session_id: session_id.clone(),
+        turn_id: Some("doctor-smoke-test".to_owned()),
+        hook_event_name: "Stop".to_owned(),
+    };
+    let result = handle_stop_hook(directory.as_ref(), &hook_input)?;
     if !matches!(result, crate::HookResult::Continue(ref reason) if reason.contains("doctor-ok")) {
         return Err("Stop hook did not produce the expected continuation".to_owned());
+    }
+    if !crate::acknowledge_hook_delivery(directory.as_ref(), &hook_input)? {
+        return Err("Stop hook continuation was not acknowledged".to_owned());
     }
     let condition = status(directory.as_ref(), &session_id)?
         .ok_or_else(|| "doctor condition disappeared".to_owned())?;
@@ -801,7 +822,7 @@ mod tests {
             .iter()
             .find(|check| check.name == "active_condition")
             .unwrap();
-        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.detail.contains("watcher Stale"));
         assert!(
             check
@@ -810,7 +831,7 @@ mod tests {
                 .unwrap()
                 .contains("next Stop hook can recover")
         );
-        assert!(!report.ok);
+        assert!(report.ok);
     }
 
     #[test]
