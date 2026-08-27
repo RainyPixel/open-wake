@@ -269,7 +269,7 @@ impl PredicateProcessGuard {
         let mut child = Command::new("sh")
             .args([
                 "-c",
-                "active=0; while IFS= read -r value; do active=$value; done; if test \"$active\" -gt 0 2>/dev/null; then kill -KILL -- \"-$active\" 2>/dev/null || :; fi",
+                "active=0; while IFS= read -r value; do active=$value; done; if test \"$active\" -gt 0 2>/dev/null; then /bin/kill -KILL -- \"-$active\" 2>/dev/null || :; fi",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
