@@ -22,7 +22,8 @@ A recurring checkpoint produces a continuation but is not terminal. The
 condition records the checkpoint and a pending notification while it remains
 `waiting`. After the response is written and flushed to Codex, the hook
 acknowledges delivery, transitions the condition back to `armed`, and keeps its
-original deadline. When that agent turn stops, the next hook invocation resumes
+original deadline. The next checkpoint is capped at that deadline instead of
+drifting past it. When that agent turn stops, the next hook invocation resumes
 checking the same predicate. For `run`, the detached command is never launched
 again.
 
@@ -84,8 +85,9 @@ reader also accepts version-1 `interval_ms`/`check_every_ms` records and
 version-2 records without pending delivery so an already active condition
 remains observable after an upgrade. On takeover, a version-1 checkpoint below
 one minute is raised to one minute, or removed when the remaining overall
-timeout cannot accommodate it. New writes do not preserve the old field names.
-A binary older than this state format cannot read version-3 records, so
+timeout cannot accommodate it; a stored checkpoint after the deadline is
+rebased into the remaining interval. New writes do not preserve the old field
+names. A binary older than this state format cannot read version-3 records, so
 downgrade after a v3 write requires discarding or manually migrating that
 ephemeral condition.
 
@@ -127,8 +129,10 @@ shorter than the timeout; values below five minutes produce a warning.
   by generation ID and retains the failed job record for inspection. A stale
   launcher cannot cancel a replacement condition.
 - Overall timeout wakes Codex with the last bounded predicate result. If a
-  supervised job has already reached a recorded terminal state, that result
-  takes precedence over a late timeout check.
+  supervised job already has a recorded terminal result or stale supervisor
+  state, that evidence takes precedence over a late timeout check. Otherwise
+  any predicate result observed at or after the deadline becomes `timed_out`,
+  even when a checkpoint also became due during that check.
 - Cancellation releases the session immediately without waking another agent
   turn. A predicate already in flight may finish before its hook process exits,
   but its result cannot overwrite the cancellation or a replacement condition.

@@ -590,13 +590,8 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
                 )?));
             }
 
-            if now_ms().saturating_sub(condition.created_at_ms) >= condition.timeout_ms {
-                let completed_job = condition
-                    .job
-                    .as_ref()
-                    .and_then(|reference| job::snapshot(&reference.root, &reference.id).ok())
-                    .filter(|snapshot| snapshot.is_ready())
-                    .map(|snapshot| format!("{}\n", snapshot.summary()));
+            if now_ms() >= condition_deadline_ms(&condition) {
+                let ready_job = ready_job_summary(&condition);
                 let Some(pending) = update_waiting_condition(
                     state_dir,
                     &input.session_id,
@@ -605,7 +600,7 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
                     "resolve condition deadline",
                     None,
                     |current| {
-                        if let Some(summary) = &completed_job {
+                        if let Some(summary) = &ready_job {
                             current.attempts += 1;
                             current.last_exit_code = Some(0);
                             current.last_output.clone_from(summary);
@@ -665,6 +660,10 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
                 }
             };
             let observed_at_ms = now_ms();
+            let deadline_at_ms = condition_deadline_ms(&condition);
+            let ready_job = (observed_at_ms >= deadline_at_ms)
+                .then(|| ready_job_summary(&condition))
+                .flatten();
             let Some(updated) = update_waiting_condition(
                 state_dir,
                 &input.session_id,
@@ -674,16 +673,28 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
                 Some(observed_at_ms),
                 |current| {
                     current.attempts += 1;
-                    current.last_exit_code = check.exit_code;
-                    current.last_output.clone_from(&check.output);
-                    if check.exit_code == Some(0) && !check.timed_out {
+                    if let Some(summary) = &ready_job {
+                        current.last_exit_code = Some(0);
+                        current.last_output.clone_from(summary);
                         queue_notification(current, NotificationKind::Succeeded);
-                    } else if current
-                        .next_checkpoint_at_ms
-                        .is_some_and(|checkpoint_at_ms| observed_at_ms >= checkpoint_at_ms)
-                    {
-                        current.checkpoints += 1;
-                        queue_notification(current, NotificationKind::Checkpoint);
+                    } else {
+                        current.last_exit_code = check.exit_code;
+                        current.last_output.clone_from(&check.output);
+                        let deadline_at_ms = condition_deadline_ms(current);
+                        if check.exit_code == Some(0)
+                            && !check.timed_out
+                            && observed_at_ms < deadline_at_ms
+                        {
+                            queue_notification(current, NotificationKind::Succeeded);
+                        } else if observed_at_ms >= deadline_at_ms {
+                            queue_notification(current, NotificationKind::TimedOut);
+                        } else if current
+                            .next_checkpoint_at_ms
+                            .is_some_and(|checkpoint_at_ms| observed_at_ms >= checkpoint_at_ms)
+                        {
+                            current.checkpoints += 1;
+                            queue_notification(current, NotificationKind::Checkpoint);
+                        }
                     }
                 },
             )?
@@ -723,6 +734,15 @@ pub fn handle_stop_hook(state_dir: &Path, input: &StopHookInput) -> Result<HookR
             error,
         ),
     }
+}
+
+fn ready_job_summary(condition: &Condition) -> Option<String> {
+    condition
+        .job
+        .as_ref()
+        .and_then(|reference| job::snapshot(&reference.root, &reference.id).ok())
+        .filter(|snapshot| snapshot.is_ready())
+        .map(|snapshot| format!("{}\n", snapshot.summary()))
 }
 
 fn recover_owned_hook_failure(
@@ -798,15 +818,15 @@ pub fn deliver_hook_notification(
         return Ok(DeliveryStatus::Superseded);
     }
 
-    deliver()?;
     condition.pending_notification = None;
 
     match notification.kind {
         NotificationKind::Checkpoint => {
             condition.status = ConditionStatus::Armed;
+            let deadline_at_ms = condition_deadline_ms(&condition);
             condition.next_checkpoint_at_ms = condition
                 .checkpoint_every_ms
-                .map(|interval| now_ms().saturating_add(interval));
+                .map(|interval| now_ms().saturating_add(interval).min(deadline_at_ms));
         }
         NotificationKind::Succeeded => {
             mark_resolved_at(
@@ -830,6 +850,9 @@ pub fn deliver_hook_notification(
             );
         }
     }
+    validate_condition(&condition)
+        .map_err(|error| format!("validate delivered condition: {error}"))?;
+    deliver()?;
     if let Err(error) = write_condition(&path, &condition) {
         return Ok(DeliveryStatus::DeliveredButUnacknowledged(format!(
             "acknowledge hook delivery: {error}"
@@ -973,6 +996,10 @@ fn mark_resolved(condition: &mut Condition, status: ConditionStatus) {
     mark_resolved_at(condition, status, now_ms());
 }
 
+fn condition_deadline_ms(condition: &Condition) -> u64 {
+    condition.created_at_ms.saturating_add(condition.timeout_ms)
+}
+
 fn mark_resolved_at(condition: &mut Condition, status: ConditionStatus, resolved_at_ms: u64) {
     condition.status = status;
     condition.resolved_at_ms = Some(resolved_at_ms);
@@ -1003,7 +1030,9 @@ fn migrate_condition_to_current(condition: &mut Condition) {
     condition.version = 3;
     let preserve_next_checkpoint = legacy_checkpoint_every_ms.is_some()
         && legacy_checkpoint_every_ms == migrated_checkpoint_every_ms
-        && condition.next_checkpoint_at_ms.is_some();
+        && condition
+            .next_checkpoint_at_ms
+            .is_some_and(|checkpoint_at_ms| checkpoint_at_ms <= condition_deadline_ms(condition));
     condition.checkpoint_every_ms = migrated_checkpoint_every_ms;
     if !preserve_next_checkpoint {
         condition.next_checkpoint_at_ms = migrated_checkpoint_every_ms
@@ -1532,9 +1561,7 @@ fn validate_condition(condition: &Condition) -> io::Result<()> {
     if condition.version >= 2
         && condition
             .next_checkpoint_at_ms
-            .is_some_and(|checkpoint_at_ms| {
-                checkpoint_at_ms > condition.created_at_ms.saturating_add(condition.timeout_ms)
-            })
+            .is_some_and(|checkpoint_at_ms| checkpoint_at_ms > condition_deadline_ms(condition))
     {
         return Err(io::Error::other(
             "condition checkpoint is after its deadline",

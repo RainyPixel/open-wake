@@ -151,9 +151,10 @@ did not. The same diagnostic survives an upgrade from a legacy
 jobs, a terminal or stale job paired with an armed zero-attempt condition is
 reported immediately rather than waiting for the condition deadline. An
 unavailable attached job is a failure because its command outcome cannot be
-inferred safely. A `waiting` condition with a stale hook lease is also a
-failure: finish the current turn so the next Stop invocation can recover the
-same condition, or cancel only when abandoning its notifications.
+inferred safely. A `waiting` condition with a stale hook lease is a warning
+before its deadline and a failure after it: finish the current turn so the next
+Stop invocation can recover the same condition, or cancel only when abandoning
+its notifications.
 
 ## Polling and checkpoints
 
@@ -166,9 +167,13 @@ The public API deliberately separates two different intervals:
 
 Checkpoints must be at least one minute and shorter than the overall timeout;
 values below five minutes produce a warning because they can reintroduce
-model-side polling. The former `--interval` and `--check-every` names are not
-accepted as aliases. `run` has no public local polling interval: supervisor
-result detection is an implementation detail.
+model-side polling. After a checkpoint, the next checkpoint is never scheduled
+past the overall deadline. If a predicate check crosses both a checkpoint and
+the deadline, the terminal timeout takes precedence unless an attached
+supervised job already has a recorded terminal result or stale supervisor
+state. The former `--interval` and `--check-every` names are not accepted as
+aliases. `run` has no public local polling interval: supervisor result detection
+is an implementation detail.
 
 ## Run a local job
 

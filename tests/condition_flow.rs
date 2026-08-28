@@ -104,6 +104,19 @@ fn make_record_version_one(state: &Path, session_id: &str) {
     fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
 }
 
+fn force_checkpoint_near_deadline(state: &Path, session_id: &str, remaining_ms: u64) {
+    let path = state.join(format!("{session_id}.json"));
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let timeout_ms = record["timeout_ms"].as_u64().unwrap();
+    assert!(remaining_ms < timeout_ms);
+    let observed_at_ms = crate_now_ms();
+    record["created_at_ms"] = observed_at_ms
+        .saturating_sub(timeout_ms.saturating_sub(remaining_ms))
+        .into();
+    record["next_checkpoint_at_ms"] = observed_at_ms.saturating_sub(1).into();
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+}
+
 fn age_file(path: &Path, seconds: i64) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -646,6 +659,141 @@ fn a_checkpoint_is_retried_before_rearming_the_condition() {
 }
 
 #[test]
+fn a_stale_checkpoint_near_deadline_is_retried_once_and_rearmed() {
+    let state = TestDir::new();
+    let mut request = request(
+        state.as_ref(),
+        "thread-checkpoint-near-deadline",
+        vec!["sh".into(), "-c".into(), "exit 1".into()],
+    );
+    request.timeout = Duration::from_secs(120);
+    request.checkpoint_every = Some(Duration::from_secs(60));
+    let armed = arm(state.as_ref(), request).unwrap();
+    force_checkpoint_near_deadline(state.as_ref(), "thread-checkpoint-near-deadline", 5_000);
+
+    let first_input = input_for_turn("thread-checkpoint-near-deadline", "interrupted-turn");
+    let HookResult::Continue(first_reason) =
+        handle_stop_hook(state.as_ref(), &first_input).unwrap()
+    else {
+        panic!("expected a checkpoint continuation");
+    };
+    assert!(first_reason.contains("progress checkpoint 1"));
+    let pending = status(state.as_ref(), "thread-checkpoint-near-deadline")
+        .unwrap()
+        .unwrap();
+    make_hook_owner_stale(
+        state.as_ref(),
+        "thread-checkpoint-near-deadline",
+        &armed.id,
+        pending.attempts,
+    );
+
+    let recovered_input = input_for_turn("thread-checkpoint-near-deadline", "recovered-turn");
+    let HookResult::Continue(recovered_reason) =
+        handle_stop_hook(state.as_ref(), &recovered_input).unwrap()
+    else {
+        panic!("expected the checkpoint to be retried");
+    };
+    assert_eq!(recovered_reason, first_reason);
+    assert!(acknowledge_hook_delivery(state.as_ref(), &recovered_input).unwrap());
+
+    let rearmed = status(state.as_ref(), "thread-checkpoint-near-deadline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rearmed.status, ConditionStatus::Armed);
+    assert!(rearmed.pending_notification.is_none());
+    assert_eq!(
+        rearmed.next_checkpoint_at_ms,
+        Some(rearmed.created_at_ms.saturating_add(rearmed.timeout_ms))
+    );
+}
+
+#[test]
+fn deadline_wins_when_a_check_crosses_a_checkpoint_and_the_deadline() {
+    let state = TestDir::new();
+    for exit_code in [0, 1] {
+        let session_id = format!("thread-check-crosses-deadline-{exit_code}");
+        let mut request = request(
+            state.as_ref(),
+            &session_id,
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!("sleep 2; exit {exit_code}"),
+            ],
+        );
+        request.timeout = Duration::from_secs(120);
+        request.checkpoint_every = Some(Duration::from_secs(60));
+        arm(state.as_ref(), request).unwrap();
+        force_checkpoint_near_deadline(state.as_ref(), &session_id, 750);
+
+        let hook_input = input(&session_id);
+        let HookResult::Continue(reason) = handle_stop_hook(state.as_ref(), &hook_input).unwrap()
+        else {
+            panic!("expected a terminal continuation");
+        };
+        assert!(reason.contains("deadline reached"));
+        assert!(!reason.contains("progress checkpoint"));
+
+        let pending = status(state.as_ref(), &session_id).unwrap().unwrap();
+        assert_eq!(pending.attempts, 1);
+        assert_eq!(pending.checkpoints, 0);
+        assert_eq!(
+            pending.pending_notification.as_ref().unwrap().kind,
+            open_wake::NotificationKind::TimedOut
+        );
+        assert!(acknowledge_hook_delivery(state.as_ref(), &hook_input).unwrap());
+        assert_eq!(
+            status(state.as_ref(), &session_id).unwrap().unwrap().status,
+            ConditionStatus::TimedOut
+        );
+    }
+}
+
+#[test]
+fn recorded_job_state_wins_when_its_check_crosses_the_deadline() {
+    let state = TestDir::new();
+    let job_root = state.as_ref().join("jobs");
+    let spec = open_wake::job::prepare(
+        &job_root,
+        "thread-job-crosses-deadline".to_owned(),
+        Some("recorded job".to_owned()),
+        state.as_ref().to_owned(),
+        vec!["true".to_owned()],
+    )
+    .unwrap();
+    let reference = open_wake::job::reference(&job_root, &spec).unwrap();
+    open_wake::job::try_record_spawn_failure(&job_root, &spec.id, "recorded result").unwrap();
+    let mut request = request(
+        state.as_ref(),
+        "thread-job-crosses-deadline",
+        vec!["sh".into(), "-c".into(), "sleep 2; exit 1".into()],
+    );
+    request.timeout = Duration::from_secs(120);
+    request.checkpoint_every = Some(Duration::from_secs(60));
+    request.job = Some(reference);
+    arm(state.as_ref(), request).unwrap();
+    force_checkpoint_near_deadline(state.as_ref(), "thread-job-crosses-deadline", 750);
+
+    let hook_input = input("thread-job-crosses-deadline");
+    let HookResult::Continue(reason) = handle_stop_hook(state.as_ref(), &hook_input).unwrap()
+    else {
+        panic!("expected a terminal continuation");
+    };
+    assert!(reason.contains("condition met"));
+    assert!(reason.contains("recorded result"));
+    assert!(!reason.contains("deadline reached"));
+    assert!(acknowledge_hook_delivery(state.as_ref(), &hook_input).unwrap());
+    assert_eq!(
+        status(state.as_ref(), "thread-job-crosses-deadline")
+            .unwrap()
+            .unwrap()
+            .status,
+        ConditionStatus::Succeeded
+    );
+}
+
+#[test]
 fn cancellation_supersedes_a_pending_notification_before_output() {
     let state = TestDir::new();
     arm(
@@ -813,6 +961,42 @@ fn a_rapid_legacy_checkpoint_is_migrated_to_the_current_minimum() {
     assert_eq!(migrated.version, 3);
     assert_eq!(migrated.checkpoint_every_ms, Some(60_000));
     assert!(migrated.next_checkpoint_at_ms.unwrap() > migrated.created_at_ms + 150);
+}
+
+#[test]
+fn a_legacy_checkpoint_after_the_deadline_is_rebased_during_migration() {
+    let state = TestDir::new();
+    let mut request = request(
+        state.as_ref(),
+        "thread-legacy-late-checkpoint",
+        vec!["true".into()],
+    );
+    request.timeout = Duration::from_secs(120);
+    request.checkpoint_every = Some(Duration::from_secs(60));
+    arm(state.as_ref(), request).unwrap();
+    make_record_version_one(state.as_ref(), "thread-legacy-late-checkpoint");
+    let path = state.as_ref().join("thread-legacy-late-checkpoint.json");
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let deadline_at_ms =
+        record["created_at_ms"].as_u64().unwrap() + record["timeout_ms"].as_u64().unwrap();
+    record["next_checkpoint_at_ms"] = deadline_at_ms.saturating_add(1).into();
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let HookResult::Continue(reason) =
+        delivered_stop_hook(state.as_ref(), "thread-legacy-late-checkpoint")
+    else {
+        panic!("expected legacy checkpoint migration to recover");
+    };
+    assert!(reason.contains("condition met"));
+
+    let migrated = status(state.as_ref(), "thread-legacy-late-checkpoint")
+        .unwrap()
+        .unwrap();
+    assert_eq!(migrated.version, 3);
+    assert!(
+        migrated.next_checkpoint_at_ms.unwrap()
+            <= migrated.created_at_ms.saturating_add(migrated.timeout_ms)
+    );
 }
 
 #[test]
