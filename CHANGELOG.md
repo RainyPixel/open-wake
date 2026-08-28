@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/RainyPixel/open-wake/compare/v0.4.0...v0.4.1) (2026-08-28)
+
+
+### Bug Fixes
+
+* **lifecycle:** enforce condition deadlines ([26b7c27](https://github.com/RainyPixel/open-wake/commit/26b7c27f398f059023281d68ae0a1121a3c84759))
+
 ## [0.4.0](https://github.com/RainyPixel/open-wake/compare/v0.3.0...v0.4.0) (2026-08-27)
 
 
