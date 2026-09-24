@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/RainyPixel/open-wake/compare/v0.4.1...v0.4.2) (2026-09-24)
+
+
+### Bug Fixes
+
+* **doctor:** clarify hook readiness ([949bd63](https://github.com/RainyPixel/open-wake/commit/949bd63e9486d066c55f81e0620e5026f87cf0ee))
+
 ## [0.4.1](https://github.com/RainyPixel/open-wake/compare/v0.4.0...v0.4.1) (2026-08-28)
 
 
