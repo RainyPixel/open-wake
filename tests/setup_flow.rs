@@ -263,13 +263,11 @@ fn cli_setup_doctor_and_uninstall_complete_a_project_lifecycle() {
     );
     let report: Value = serde_json::from_slice(&doctor_output.stdout).unwrap();
     assert_eq!(report["ok"], true);
-    assert!(
-        report["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|check| { check["name"] == "project_hook_trust" && check["status"] == "warn" })
-    );
+    assert!(report["checks"].as_array().unwrap().iter().any(|check| {
+        check["name"] == "project_hook_trust"
+            && check["status"] == "warn"
+            && check["detail"] == "no saved trust decision for the managed Stop hook"
+    }));
     assert!(
         report["checks"]
             .as_array()
@@ -291,6 +289,24 @@ fn cli_setup_doctor_and_uninstall_complete_a_project_lifecycle() {
         .unwrap()
         .parse::<DocumentMut>()
         .unwrap();
+    config["hooks"]["state"][&state_key]["trusted_hash"] =
+        value(format!("sha256:{}", "a".repeat(64)));
+    fs::write(&config_path, config.to_string()).unwrap();
+
+    let trusted_doctor = Command::new(&executable)
+        .args(["doctor", "--scope", "project", "--project-dir"])
+        .arg(&project)
+        .env("HOME", &home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("OPEN_WAKE_NO_UPDATE_CHECK", "1")
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(trusted_doctor.status.success());
+    let output = String::from_utf8_lossy(&trusted_doctor.stdout);
+    assert!(output.contains("doctor: healthy\n"), "{output}");
+    assert!(!output.contains("project_hook_trust"), "{output}");
+
     config["hooks"]["state"][&state_key]["enabled"] = value(false);
     fs::write(&config_path, config.to_string()).unwrap();
 

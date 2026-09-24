@@ -9,6 +9,11 @@ Use `open-wake` to end the current turn while work continues locally. Prefer its
 small detached supervisor for ordinary local commands; observe external systems
 through their own durable authority.
 
+For a long task, call `run` or `arm` directly when the hook is already installed.
+Do not run `doctor` as a prerequisite to every gate. Doctor checks local setup
+and an isolated protocol test; only a real armed condition can show whether the
+current Codex host invoked its `Stop` hook.
+
 ## Workflow
 
 1. For a small local Unix build, test, or script, launch and arm it together:
@@ -63,9 +68,9 @@ through their own durable authority.
    explicit operator `turn_aborted` as an expected interruption, not an
    open-wake crash. Run `open-wake doctor` for evidence;
    use `open-wake cancel` only when abandoning notifications, not as a prefix
-   for every new `run`. If doctor reports hook setup or trust problems, ask the
-   user to review `/hooks`, trust the exact command, and restart Codex before
-   arming another condition.
+   for every new `run`. If doctor reports a missing or stale hook, repair that
+   setup. If it reports no saved trust decision, ask the user to review and
+   trust the exact command in `/hooks`. Restart Codex after setup changes.
 
 `open-wake cancel` makes the condition terminal immediately and permits a new
 condition in the same Codex session. It stops future wake-ups but does not
@@ -92,9 +97,13 @@ Use `open-wake status --json` to diagnose state. `open-wake logs [JOB_ID]`
 prints only an absolute path. Only one condition may be active per Codex
 session.
 
-If setup is missing or stale, run `open-wake doctor`. Apply the exact
-`open-wake setup --scope user|project` command it recommends, then review and
-trust the installed hook with `/hooks`. Setup enables the hook but never grants
-trust silently, so restart Codex after setup and verify both states in `/hooks`.
+If setup is missing or stale, run `open-wake doctor` and apply the exact
+`open-wake setup --scope user|project` command it recommends. Setup enables the
+hook but never grants trust silently. Restart Codex after setup; if doctor
+reports no saved trust decision or Codex asks for review, have the user trust
+the exact hook command in `/hooks`. A passing local protocol test is not proof
+of a live host invocation, but the absence of that proof before the first run
+is not a reason to skip `open-wake`.
 Treat stale-job warnings as uncertain: inspect the log and process evidence,
-and never assume the child stopped.
+and never assume the child stopped. A warning about an unrelated old job does
+not block a new condition; check for duplicate work when the job is related.

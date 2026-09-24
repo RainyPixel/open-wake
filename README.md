@@ -135,18 +135,21 @@ verifies:
 - the latest published GitHub release, unless offline checks are disabled;
 - the selected hook command, timeout, and ownership marker;
 - whether the exact managed hook is enabled in Codex state;
+- whether Codex has a saved trust decision for the managed hook;
 - the installed skill bytes;
 - whether `open-wake` is on `PATH` for project scope.
 
 Doctor never repairs configuration, kills processes, or deletes job records.
 Failed checks exit non-zero and include an actionable fix. A stale job is
 a warning with its ID and log path because heartbeat loss is not proof that the
-child stopped. Hook trust remains a warning because setup deliberately leaves
-security review to interactive `/hooks` rather than writing a trusted hash.
-The isolated protocol smoke test proves the handler but cannot prove that the
-current Codex host invoked the configured `Stop` hook. Doctor reports an
-expired active condition with zero attempts as a failure and evidence that it
-did not. The same diagnostic survives an upgrade from a legacy
+child stopped. Doctor warns about hook trust only when no saved trust decision
+is present; setup deliberately leaves security review to interactive `/hooks`.
+A saved decision can become stale if the hook definition changes, so it is not
+proof that the current Codex host will invoke the hook. The isolated protocol
+smoke test proves the handler but cannot prove host invocation. Arm a condition
+to observe that path. Doctor reports an expired active condition with zero
+attempts as a failure and evidence that the hook was not invoked. The same
+diagnostic survives an upgrade from a legacy
 `cancel_requested` record until `open-wake cancel` normalizes it. For supervised
 jobs, a terminal or stale job paired with an armed zero-attempt condition is
 reported immediately rather than waiting for the condition deadline. An

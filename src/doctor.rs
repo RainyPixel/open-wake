@@ -1,4 +1,7 @@
-use crate::setup::{InstallScope, SetupTarget, inspect_hook, inspect_hook_enabled, inspect_skill};
+use crate::setup::{
+    InstallScope, SetupTarget, inspect_hook, inspect_hook_enabled, inspect_hook_trust_record,
+    inspect_skill,
+};
 use crate::update::check_for_update_cached;
 use crate::{
     ArmRequest, Condition, ConditionStatus, StopHookInput, WatcherState, WatcherStatus, arm,
@@ -561,16 +564,21 @@ fn inspect_target(target: &SetupTarget, report: &mut DoctorReport) {
         });
     }
 
-    report.push(DoctorCheck {
-        name: format!("{prefix}_hook_trust"),
-        status: CheckStatus::Warn,
-        detail: "hook enablement is verified, but trust still requires interactive Codex review"
-            .to_owned(),
-        fix: Some(
-            "open `/hooks`, verify the hook is enabled, review the command, and trust it if requested"
-                .to_owned(),
-        ),
-    });
+    match inspect_hook_trust_record(target) {
+        Ok(true) => {}
+        Ok(false) => report.push(DoctorCheck {
+            name: format!("{prefix}_hook_trust"),
+            status: CheckStatus::Warn,
+            detail: "no saved trust decision for the managed Stop hook".to_owned(),
+            fix: Some("open `/hooks` in Codex and trust the exact hook command".to_owned()),
+        }),
+        Err(error) => report.push(DoctorCheck {
+            name: format!("{prefix}_hook_trust"),
+            status: CheckStatus::Warn,
+            detail: format!("could not inspect the saved hook trust decision: {error}"),
+            fix: Some("inspect the Codex hook configuration and rerun doctor".to_owned()),
+        }),
+    }
 }
 
 fn protocol_smoke_test() -> Result<(), String> {

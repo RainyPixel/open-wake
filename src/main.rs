@@ -757,14 +757,18 @@ fn print_doctor_report(report: &DoctorReport, json: bool) -> Result<(), String> 
             println!("     fix: {fix}");
         }
     }
-    println!(
-        "doctor: {}",
-        if report.ok {
-            "healthy (warnings may require interactive review)"
-        } else {
-            "problems found"
-        }
-    );
+    let summary = if !report.ok {
+        "problems found"
+    } else if report
+        .checks
+        .iter()
+        .any(|check| check.status == CheckStatus::Warn)
+    {
+        "healthy with warnings"
+    } else {
+        "healthy"
+    };
+    println!("doctor: {summary}");
     Ok(())
 }
 

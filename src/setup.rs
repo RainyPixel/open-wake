@@ -271,6 +271,34 @@ pub fn inspect_hook(target: &SetupTarget) -> Result<(), String> {
 }
 
 pub fn inspect_hook_enabled(target: &SetupTarget) -> Result<bool, String> {
+    let Some((state_key, entry)) = read_managed_hook_state(target)? else {
+        return Ok(true);
+    };
+    match entry.get("enabled") {
+        Some(enabled) => enabled.as_bool().ok_or_else(|| {
+            format!(
+                "{} stores a non-boolean enabled state for {state_key}",
+                target.codex_config_path.as_ref().unwrap().display(),
+            )
+        }),
+        None => Ok(true),
+    }
+}
+
+pub fn inspect_hook_trust_record(target: &SetupTarget) -> Result<bool, String> {
+    let Some((_, entry)) = read_managed_hook_state(target)? else {
+        return Ok(false);
+    };
+    Ok(entry
+        .get("trusted_hash")
+        .and_then(Item::as_str)
+        .and_then(|hash| hash.strip_prefix("sha256:"))
+        .is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }))
+}
+
+fn read_managed_hook_state(target: &SetupTarget) -> Result<Option<(String, Table)>, String> {
     let config_path = target
         .codex_config_path
         .as_ref()
@@ -285,7 +313,7 @@ pub fn inspect_hook_enabled(target: &SetupTarget) -> Result<bool, String> {
     }
     let (document, existed) = read_codex_config(config_path)?;
     if !existed {
-        return Ok(true);
+        return Ok(None);
     }
     let Some(state) = document
         .get("hooks")
@@ -293,21 +321,12 @@ pub fn inspect_hook_enabled(target: &SetupTarget) -> Result<bool, String> {
         .and_then(|hooks| hooks.get("state"))
         .and_then(Item::as_table)
     else {
-        return Ok(true);
+        return Ok(None);
     };
     let Some(entry) = state.get(&state_keys[0]).and_then(Item::as_table) else {
-        return Ok(true);
+        return Ok(None);
     };
-    match entry.get("enabled") {
-        Some(enabled) => enabled.as_bool().ok_or_else(|| {
-            format!(
-                "{} stores a non-boolean enabled state for {}",
-                config_path.display(),
-                state_keys[0]
-            )
-        }),
-        None => Ok(true),
-    }
+    Ok(Some((state_keys[0].clone(), entry.clone())))
 }
 
 pub fn inspect_skill(target: &SetupTarget) -> Result<(), String> {
